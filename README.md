@@ -107,7 +107,7 @@ DB_Project_Code/
 ### 3. Run the Application in VS Code
 1. Clone the repository and open the `DB_Project_Code` folder in **VS Code**:
    ```bash
-   git clone https://github.com<your-username>/<your-repo-name>.git
+   git clone https://github.com/J-hassan/Database-Project.git
    code DB_Project_Code
    ```
 2. Open the integrated terminal in VS Code (`Ctrl + ~`) and navigate to the `timetable` module directory:
