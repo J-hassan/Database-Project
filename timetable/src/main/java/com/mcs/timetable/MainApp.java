@@ -22,7 +22,7 @@ import java.util.Map;
 
 public class MainApp extends Application {
 
-    // Tab 1 Controls
+    // Tab 1 Controls (Permanent Master Timetable)
     private final ComboBox<String> sectionDropdown = new ComboBox<>();
     private final Map<String, Integer> sectionMap = new HashMap<>();
     private final GridPane timetableGrid = new GridPane();
@@ -53,23 +53,29 @@ public class MainApp extends Application {
     private final ComboBox<String> freePeriodBox = new ComboBox<>();
     private final TableView<ObservableList<String>> freeFacultyTable = new TableView<>();
 
-    // Tab 6 Reschedule Single Class Controls
+    // Tab 6 Weekly Reschedule & Separate Weekly Timetable Grid
     private final ComboBox<String> reschedSectionBox = new ComboBox<>();
     private final ComboBox<String> reschedTeacherBox = new ComboBox<>();
     private final TableView<ObservableList<String>> reschedClassesTable = new TableView<>();
+    private final GridPane weeklyTimetableGrid = new GridPane();
     private final TextArea reschedLogArea = new TextArea();
 
     @Override
     public void start(Stage stage) {
+
+        Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
+            javafx.application.Platform.runLater(() -> showAlert("Application Notice",
+                    "An operation could not be completed:\n" + throwable.getMessage()));
+        });
         TabPane tabPane = new TabPane();
         tabPane.setTabClosingPolicy(TabPane.TabClosingPolicy.UNAVAILABLE);
 
-        Tab tab1 = new Tab("📅 Timetable & Generator", buildTimetableTab());
+        Tab tab1 = new Tab("📅 Master Timetable", buildTimetableTab());
         Tab tab2 = new Tab("👨‍🏫 Faculty & Rooms", buildMasterDataTab());
         Tab tab3 = new Tab("📚 Allocations & Replace", buildAllocationsTab());
         Tab tab4 = new Tab("🔍 Teacher / Room Schedule", buildLookupTab());
         Tab tab5 = new Tab("🟢 Free Instructors (Meetings)", buildFreeInstructorsTab());
-        Tab tab6 = new Tab("🔁 Reschedule Class", buildRescheduleTab());
+        Tab tab6 = new Tab("🔁 Weekly Reschedule", buildRescheduleTab());
 
         tabPane.getTabs().addAll(tab1, tab2, tab3, tab4, tab5, tab6);
 
@@ -79,24 +85,24 @@ public class MainApp extends Application {
 
         refreshAllDropdownsAndTables();
 
-        Scene scene = new Scene(tabPane, 1380, 770);
+        Scene scene = new Scene(tabPane, 1380, 780);
         stage.setTitle("MCS NUST - Automated Training Program & Conflict-Free Scheduler");
         stage.setScene(scene);
         stage.show();
     }
 
     // ========================================================================
-    // TAB 1: TIMETABLE GRID (WITH EXACT IMAGE COLORS & TUE/WED SEMINARS)
+    // TAB 1: PERMANENT MASTER TIMETABLE GRID
     // ========================================================================
     private VBox buildTimetableTab() {
-        Label title = new Label("MCS NUST - Automated Training Program & Timetable System (Fall-2026)");
+        Label title = new Label("MCS NUST - Permanent Master Training Program (Fall-2026)");
         title.setStyle("-fx-font-size: 18px; -fx-font-weight: bold; -fx-text-fill: #1a237e;");
 
-        Button generateBtn = new Button("⚡ Generate Conflict-Free Timetable");
+        Button generateBtn = new Button("⚡ Generate Master Timetable");
         generateBtn.setStyle(
                 "-fx-background-color: #1b5e20; -fx-text-fill: white; -fx-font-weight: bold; -fx-padding: 8 16;");
 
-        Button exportBtn = new Button("📄 Export CSV");
+        Button exportBtn = new Button("📄 Export Master CSV");
         exportBtn.setStyle(
                 "-fx-background-color: #0277bd; -fx-text-fill: white; -fx-font-weight: bold; -fx-padding: 8 16;");
 
@@ -105,37 +111,38 @@ public class MainApp extends Application {
             if (secName == null)
                 return;
             FileChooser fc = new FileChooser();
-            fc.setInitialFileName(secName.replace(" ", "_") + "_Timetable_Fall2026.csv");
+            fc.setInitialFileName(secName.replace(" ", "_") + "_Master_Timetable.csv");
             fc.getExtensionFilters().add(new FileChooser.ExtensionFilter("CSV Files", "*.csv"));
             File file = fc.showSaveDialog(null);
             if (file != null) {
-                exportSectionToCSV(sectionMap.get(secName), secName, file);
+                exportSectionToCSV(sectionMap.get(secName), secName, file, false);
             }
         });
 
         sectionDropdown.setPrefWidth(200);
 
-        // Exact Color Legend matching MCS Training Program Image
         HBox legend = new HBox(10,
                 makeLegendBadge("Theory", "#ffffff"),
                 makeLegendBadge("Lab (3 Hrs)", "#ffee00"),
                 makeLegendBadge("STI", "#ffbb00"),
                 makeLegendBadge("Seminar/HOD", "#ce93d8"),
-                makeLegendBadge("Break / Zohar", "#f5f5f5"),
-                makeLegendBadge("Rescheduled", "#f8bbd0"));
+                makeLegendBadge("Break / Zohar", "#f5f5f5"));
         legend.setAlignment(Pos.CENTER_LEFT);
 
         HBox controls = new HBox(15, new Label("Section:"), sectionDropdown, generateBtn, exportBtn, legend);
         controls.setAlignment(Pos.CENTER_LEFT);
 
-        timetableGrid.setGridLinesVisible(true);
-        timetableGrid.setHgap(1);
-        timetableGrid.setVgap(1);
-        timetableGrid.setStyle("-fx-background-color: #000000; -fx-padding: 4;");
+        // Pure White Clean Grid Background (No black background)
+        timetableGrid.setGridLinesVisible(false);
+        timetableGrid.setHgap(2);
+        timetableGrid.setVgap(2);
+        timetableGrid.setStyle(
+                "-fx-background-color: #ffffff; -fx-padding: 6; -fx-border-color: #bdbdbd; -fx-border-width: 1;");
 
         ScrollPane scrollPane = new ScrollPane(timetableGrid);
         scrollPane.setFitToWidth(true);
         scrollPane.setPrefHeight(510);
+        scrollPane.setStyle("-fx-background: #ffffff; -fx-background-color: #ffffff;");
 
         statusArea.setEditable(false);
         statusArea.setPrefRowCount(3);
@@ -145,20 +152,14 @@ public class MainApp extends Application {
             TimetableGenerator generator = new TimetableGenerator();
             String result = generator.generateForTerm("Fall-2026");
             statusArea.setText(result);
-            if (sectionDropdown.getValue() != null && sectionMap.containsKey(sectionDropdown.getValue())) {
-                renderTimetableForSection(sectionMap.get(sectionDropdown.getValue()));
-            }
+            refreshTab1Grid();
         });
 
-        sectionDropdown.setOnAction(e -> {
-            if (sectionDropdown.getValue() != null && sectionMap.containsKey(sectionDropdown.getValue())) {
-                renderTimetableForSection(sectionMap.get(sectionDropdown.getValue()));
-            }
-        });
+        sectionDropdown.setOnAction(e -> refreshTab1Grid());
 
         VBox box = new VBox(10, title, controls, scrollPane, new Label("Generator Log / Status:"), statusArea);
         box.setPadding(new Insets(15));
-        box.setStyle("-fx-background-color: #f4f6f9;");
+        box.setStyle("-fx-background-color: #ffffff;");
         return box;
     }
 
@@ -261,10 +262,10 @@ public class MainApp extends Application {
     }
 
     // ========================================================================
-    // TAB 3: COURSE ALLOCATIONS + INSTRUCTOR & LAB ENGINEER REPLACEMENT
+    // TAB 3: COURSE ALLOCATIONS + INSTRUCTOR & LAB ENGINEER REPLACE / REMOVE
     // ========================================================================
     private VBox buildAllocationsTab() {
-        Label title = new Label("Course Allocations & Mid-Semester Instructor / Lab Engineer Replacement");
+        Label title = new Label("Course Allocations & Mid-Semester Instructor / Lab Engineer Management");
         title.setStyle("-fx-font-size: 16px; -fx-font-weight: bold; -fx-text-fill: #1a237e;");
 
         allocSectionBox.setPromptText("Section");
@@ -282,7 +283,7 @@ public class MainApp extends Application {
         Button assignBtn = new Button("+ Allocate");
         assignBtn.setStyle("-fx-background-color: #1b5e20; -fx-text-fill: white; -fx-font-weight: bold;");
 
-        Button deleteAllocBtn = new Button("🗑 Remove");
+        Button deleteAllocBtn = new Button("🗑 Delete Row");
         deleteAllocBtn.setStyle("-fx-background-color: #b71c1c; -fx-text-fill: white;");
 
         assignBtn.setOnAction(e -> {
@@ -337,7 +338,7 @@ public class MainApp extends Application {
         // Bar 1: Mid-Semester Instructor Replacement
         ComboBox<String> replacementInstBox = new ComboBox<>();
         replacementInstBox.setPromptText("New Instructor");
-        replacementInstBox.setPrefWidth(210);
+        replacementInstBox.setPrefWidth(195);
         replacementInstBox.setItems(allocInstBox.getItems());
 
         Button replaceInstBtn = new Button("🔄 Replace Instructor");
@@ -356,19 +357,18 @@ public class MainApp extends Application {
             showAlert("Instructor Replacement Report", report);
         });
 
-        // Bar 2: Mid-Semester Lab Engineer (LE) Replacement
+        // Bar 2: Mid-Semester Lab Engineer Replacement & Removal
         ComboBox<String> replacementLEBox = new ComboBox<>();
         replacementLEBox.setPromptText("New Lab Engineer");
-        replacementLEBox.setPrefWidth(210);
+        replacementLEBox.setPrefWidth(195);
         replacementLEBox.setItems(allocLEBox.getItems());
 
-        Button replaceLEBtn = new Button("🧪 Replace Lab Engineer");
+        Button replaceLEBtn = new Button("🧪 Replace LE");
         replaceLEBtn.setStyle("-fx-background-color: #00695c; -fx-text-fill: white; -fx-font-weight: bold;");
         replaceLEBtn.setOnAction(e -> {
             ObservableList<String> selected = allocTable.getSelectionModel().getSelectedItem();
             if (selected == null || replacementLEBox.getValue() == null || "NONE".equals(replacementLEBox.getValue())) {
-                showAlert("Selection Required",
-                        "Select a Lab course row from the table below and choose a New Lab Engineer.");
+                showAlert("Selection Required", "Select a row from the table below and choose a New Lab Engineer.");
                 return;
             }
             int allocId = Integer.parseInt(selected.get(0));
@@ -379,11 +379,26 @@ public class MainApp extends Application {
             showAlert("Lab Engineer Replacement Report", report);
         });
 
-        HBox replaceBar = new HBox(12,
-                new Label("Mid-Semester Replacement (Select Row First):"),
+        Button removeLEBtn = new Button("❌ Remove LE");
+        removeLEBtn.setStyle("-fx-background-color: #c62828; -fx-text-fill: white; -fx-font-weight: bold;");
+        removeLEBtn.setOnAction(e -> {
+            ObservableList<String> selected = allocTable.getSelectionModel().getSelectedItem();
+            if (selected == null) {
+                showAlert("Selection Required", "Select a row from the table below to remove its Lab Engineer.");
+                return;
+            }
+            int allocId = Integer.parseInt(selected.get(0));
+            String report = new TimetableGenerator().removeLabEngineer("Fall-2026", allocId);
+            loadAllocationsTable();
+            refreshTab1Grid();
+            showAlert("Lab Engineer Removed", report);
+        });
+
+        HBox replaceBar = new HBox(10,
+                new Label("Select Row First:"),
                 replacementInstBox, replaceInstBtn,
                 new Separator(javafx.geometry.Orientation.VERTICAL),
-                replacementLEBox, replaceLEBtn);
+                replacementLEBox, replaceLEBtn, removeLEBtn);
         replaceBar.setAlignment(Pos.CENTER_LEFT);
         replaceBar.setStyle(
                 "-fx-background-color: #fff3e0; -fx-padding: 10; -fx-border-color: #ffb74d; -fx-border-radius: 5;");
@@ -422,10 +437,11 @@ public class MainApp extends Application {
     }
 
     // ========================================================================
-    // TAB 5: FREE INSTRUCTORS FINDER (FOR MEETINGS)
+    // TAB 5: FREE INSTRUCTORS FINDER (THEORY INSTRUCTORS ARE FREE DURING LABS!)
     // ========================================================================
     private VBox buildFreeInstructorsTab() {
-        Label title = new Label("Find Available / Free Instructors & Lab Engineers for Meetings");
+        Label title = new Label(
+                "Find Available / Free Instructors & Lab Engineers for Meetings (Theory Instructors Free During Labs)");
         title.setStyle("-fx-font-size: 16px; -fx-font-weight: bold; -fx-text-fill: #1a237e;");
 
         freeDayBox.setItems(FXCollections.observableArrayList("MON", "TUE", "WED", "THU", "FRI"));
@@ -459,7 +475,7 @@ public class MainApp extends Application {
                 "-fx-background-color: #e8f5e9; -fx-padding: 10; -fx-border-color: #81c784; -fx-border-radius: 5;");
 
         setupTableColumns(freeFacultyTable,
-                new String[] { "Faculty ID", "Rank", "Full Name", "Role", "Department", "Status" });
+                new String[] { "Faculty ID", "Rank", "Full Name", "Role", "Department", "Availability Note" });
 
         VBox box = new VBox(12, title, filterBar, freeFacultyTable);
         box.setPadding(new Insets(15));
@@ -473,18 +489,29 @@ public class MainApp extends Application {
             return;
         int periodNo = Integer.parseInt(periodStr.split(" ")[0]);
 
+        // Busy ONLY if conducting THEORY/STI as instructor OR conducting LAB as
+        // lab_engineer
+        // Theory instructors are FREE during LAB periods!
         String sql = """
-                    SELECT f.faculty_id, f.rank_title, f.full_name, f.designation_role, f.department, 'FREE / AVAILABLE'
+                    SELECT f.faculty_id, f.rank_title, f.full_name, f.designation_role, f.department,
+                           IF(EXISTS(
+                               SELECT 1 FROM timetable_schedule sch2
+                               JOIN time_slots ts2 ON sch2.slot_id = ts2.slot_id
+                               WHERE sch2.semester_term = 'Fall-2026' AND ts2.day_of_week = ? AND ts2.period_no = ?
+                                 AND sch2.instructor_id = f.faculty_id AND sch2.session_type = 'LAB'
+                           ), 'FREE (Section in Lab with LE)', 'FREE / AVAILABLE') AS status_note
                     FROM faculty f
                     WHERE f.faculty_id NOT IN (
                         SELECT sch.instructor_id FROM timetable_schedule sch
                         JOIN time_slots ts ON sch.slot_id = ts.slot_id
-                        WHERE sch.semester_term = 'Fall-2026' AND ts.day_of_week = ? AND ts.period_no = ? AND sch.instructor_id IS NOT NULL
+                        WHERE sch.semester_term = 'Fall-2026' AND ts.day_of_week = ? AND ts.period_no = ?
+                          AND sch.instructor_id IS NOT NULL AND sch.session_type IN ('THEORY', 'STI')
                     )
                     AND f.faculty_id NOT IN (
                         SELECT sch.lab_engineer_id FROM timetable_schedule sch
                         JOIN time_slots ts ON sch.slot_id = ts.slot_id
-                        WHERE sch.semester_term = 'Fall-2026' AND ts.day_of_week = ? AND ts.period_no = ? AND sch.lab_engineer_id IS NOT NULL
+                        WHERE sch.semester_term = 'Fall-2026' AND ts.day_of_week = ? AND ts.period_no = ?
+                          AND sch.lab_engineer_id IS NOT NULL AND sch.session_type = 'LAB'
                     )
                     ORDER BY f.department, f.full_name
                 """;
@@ -495,6 +522,8 @@ public class MainApp extends Application {
             ps.setInt(2, periodNo);
             ps.setString(3, day);
             ps.setInt(4, periodNo);
+            ps.setString(5, day);
+            ps.setInt(6, periodNo);
             ResultSet rs = ps.executeQuery();
             while (rs.next()) {
                 ObservableList<String> row = FXCollections.observableArrayList();
@@ -510,58 +539,108 @@ public class MainApp extends Application {
     }
 
     // ========================================================================
-    // TAB 6: RESCHEDULE SINGLE CLASS (WITH CONFLICT & EXISTING RESCHEDULE CHECK)
+    // TAB 6: WEEKLY RESCHEDULE & SEPARATE EXPORTABLE WEEKLY TIMETABLE
     // ========================================================================
     private VBox buildRescheduleTab() {
         Label title = new Label(
-                "Reschedule Individual Class (Auto-Finds Clash-Free Slot & Prevents Double-Teacher Overlap)");
+                "Weekly Class Rescheduler (Generates Separate Weekly Timetable Without Altering Permanent Master)");
         title.setStyle("-fx-font-size: 16px; -fx-font-weight: bold; -fx-text-fill: #1a237e;");
 
-        reschedSectionBox.setPromptText("Select Section (All Semesters)");
-        reschedSectionBox.setPrefWidth(200);
+        reschedSectionBox.setPromptText("Select Section");
+        reschedSectionBox.setPrefWidth(180);
 
-        reschedTeacherBox.setPromptText("Select Instructor in Section");
-        reschedTeacherBox.setPrefWidth(240);
+        reschedTeacherBox.setPromptText("Select Instructor");
+        reschedTeacherBox.setPrefWidth(220);
 
-        reschedSectionBox.setOnAction(e -> loadTeachersForReschedSection());
+        reschedSectionBox.setOnAction(e -> {
+            loadTeachersForReschedSection();
+            renderWeeklyTimetableForSection();
+        });
         reschedTeacherBox.setOnAction(e -> loadScheduledClassesForTeacher());
 
-        Button rescheduleBtn = new Button("🔁 Reschedule Selected Class to Free Slot");
+        Button rescheduleBtn = new Button("🔁 Reschedule Selected Class (This Week)");
         rescheduleBtn.setStyle(
-                "-fx-background-color: #ad1457; -fx-text-fill: white; -fx-font-weight: bold; -fx-padding: 7 15;");
+                "-fx-background-color: #ad1457; -fx-text-fill: white; -fx-font-weight: bold; -fx-padding: 6 14;");
+
+        Button exportWeeklyBtn = new Button("📄 Export Weekly Timetable (CSV)");
+        exportWeeklyBtn.setStyle(
+                "-fx-background-color: #0277bd; -fx-text-fill: white; -fx-font-weight: bold; -fx-padding: 6 14;");
+
+        Button resetWeeklyBtn = new Button("🔄 Reset Weekly Changes");
+        resetWeeklyBtn.setStyle(
+                "-fx-background-color: #546e7a; -fx-text-fill: white; -fx-font-weight: bold; -fx-padding: 6 12;");
 
         rescheduleBtn.setOnAction(e -> {
             ObservableList<String> selected = reschedClassesTable.getSelectionModel().getSelectedItem();
             if (selected == null) {
-                showAlert("Select Class", "Please select a scheduled class row from the table to reschedule.");
+                showAlert("Select Class",
+                        "Select a scheduled class row from the top table to reschedule for this week.");
                 return;
             }
             int scheduleId = Integer.parseInt(selected.get(0));
-            String report = new TimetableGenerator().rescheduleSingleClass("Fall-2026", scheduleId);
+            String report = new TimetableGenerator().rescheduleClassForWeekOnly("Fall-2026", scheduleId);
             reschedLogArea.setText(report);
             loadScheduledClassesForTeacher();
-            refreshTab1Grid();
+            renderWeeklyTimetableForSection();
         });
 
-        HBox topBar = new HBox(12,
+        exportWeeklyBtn.setOnAction(e -> {
+            String secName = reschedSectionBox.getValue();
+            if (secName == null || !sectionMap.containsKey(secName))
+                return;
+            FileChooser fc = new FileChooser();
+            fc.setInitialFileName(secName.replace(" ", "_") + "_Weekly_Rescheduled_Timetable.csv");
+            fc.getExtensionFilters().add(new FileChooser.ExtensionFilter("CSV Files", "*.csv"));
+            File file = fc.showSaveDialog(null);
+            if (file != null) {
+                exportSectionToCSV(sectionMap.get(secName), secName, file, true);
+            }
+        });
+
+        resetWeeklyBtn.setOnAction(e -> {
+            String secName = reschedSectionBox.getValue();
+            if (secName == null || !sectionMap.containsKey(secName))
+                return;
+            new TimetableGenerator().clearWeeklyReschedulesForSection("Fall-2026", sectionMap.get(secName));
+            reschedLogArea
+                    .setText("Weekly reschedules cleared for " + secName + ". Showing original Master Timetable.");
+            loadScheduledClassesForTeacher();
+            renderWeeklyTimetableForSection();
+        });
+
+        HBox topBar = new HBox(10,
                 new Label("1. Section:"), reschedSectionBox,
                 new Label("2. Teacher:"), reschedTeacherBox,
-                rescheduleBtn);
+                rescheduleBtn, exportWeeklyBtn, resetWeeklyBtn);
         topBar.setAlignment(Pos.CENTER_LEFT);
         topBar.setStyle(
-                "-fx-background-color: #fce4ec; -fx-padding: 10; -fx-border-color: #f48fb1; -fx-border-radius: 5;");
+                "-fx-background-color: #fce4ec; -fx-padding: 8; -fx-border-color: #f48fb1; -fx-border-radius: 5;");
 
         setupTableColumns(reschedClassesTable, new String[] {
-                "Sched ID", "Day", "Period", "Timing", "Course", "Type", "Room", "Rescheduled Status"
+                "Sched ID", "Day", "Period", "Timing", "Course", "Type", "Room", "Weekly Status"
         });
+        reschedClassesTable.setPrefHeight(135);
+
+        weeklyTimetableGrid.setGridLinesVisible(false);
+        weeklyTimetableGrid.setHgap(2);
+        weeklyTimetableGrid.setVgap(2);
+        weeklyTimetableGrid.setStyle(
+                "-fx-background-color: #ffffff; -fx-padding: 6; -fx-border-color: #bdbdbd; -fx-border-width: 1;");
+
+        ScrollPane weeklyScroll = new ScrollPane(weeklyTimetableGrid);
+        weeklyScroll.setFitToWidth(true);
+        weeklyScroll.setPrefHeight(400);
+        weeklyScroll.setStyle("-fx-background: #ffffff; -fx-background-color: #ffffff;");
 
         reschedLogArea.setEditable(false);
-        reschedLogArea.setPrefRowCount(6);
-        reschedLogArea.setStyle("-fx-font-family: 'Consolas'; -fx-font-size: 12px;");
+        reschedLogArea.setPrefRowCount(3);
+        reschedLogArea.setStyle("-fx-font-family: 'Consolas'; -fx-font-size: 11px;");
 
-        VBox box = new VBox(12, title, topBar, reschedClassesTable, new Label("Rescheduling & Clash Verification Log:"),
-                reschedLogArea);
-        box.setPadding(new Insets(15));
+        VBox box = new VBox(8, title, topBar, reschedClassesTable,
+                new Label("Generated Weekly Timetable Preview (Shareable with Students for This Week Only):"),
+                weeklyScroll, reschedLogArea);
+        box.setPadding(new Insets(12));
+        box.setStyle("-fx-background-color: #ffffff;");
         return box;
     }
 
@@ -599,7 +678,13 @@ public class MainApp extends Application {
         String sql = """
                     SELECT sch.schedule_id, ts.day_of_week, ts.period_no, CONCAT(ts.start_time, '-', ts.end_time),
                            c.course_title, sch.session_type, IFNULL(r.room_name, 'Office/STI'),
-                           IF(sch.is_rescheduled = TRUE, '⚠️ ALREADY RESCHEDULED', 'Regular Slot')
+                           IFNULL((
+                               SELECT CONCAT('⚠️ MOVED TO ', ts2.day_of_week, ' P', ts2.period_no)
+                               FROM weekly_rescheduled_schedule wr
+                               JOIN time_slots ts2 ON wr.new_slot_id = ts2.slot_id
+                               WHERE wr.section_id = sch.section_id AND wr.original_slot_id = sch.slot_id
+                                 AND wr.semester_term = 'Fall-2026' LIMIT 1
+                           ), 'Regular Master Slot')
                     FROM timetable_schedule sch
                     JOIN time_slots ts ON sch.slot_id = ts.slot_id
                     JOIN course_allocations ca ON sch.allocation_id = ca.allocation_id
@@ -626,13 +711,21 @@ public class MainApp extends Application {
     }
 
     // ========================================================================
-    // RENDER TIMETABLE WITH SEMESTER-SPECIFIC BREAKS & EXACT MCS COLORS
-    // ========================================================================
-    // ========================================================================
-    // RENDER TIMETABLE WITH SEMESTER-SPECIFIC BREAKS & EXACT MCS COLORS
+    // SHARED GRID RENDERER (FOR BOTH PERMANENT MASTER & WEEKLY RESCHEDULED)
     // ========================================================================
     private void renderTimetableForSection(int sectionId) {
-        timetableGrid.getChildren().clear();
+        renderGridIntoTarget(timetableGrid, sectionId, false);
+    }
+
+    private void renderWeeklyTimetableForSection() {
+        String sec = reschedSectionBox.getValue();
+        if (sec != null && sectionMap.containsKey(sec)) {
+            renderGridIntoTarget(weeklyTimetableGrid, sectionMap.get(sec), true);
+        }
+    }
+
+    private void renderGridIntoTarget(GridPane targetGrid, int sectionId, boolean includeWeeklyOverrides) {
+        targetGrid.getChildren().clear();
 
         int batchNo = 31;
         try (Connection conn = DatabaseConnection.getConnection();
@@ -685,14 +778,17 @@ public class MainApp extends Application {
             periodToCol[7] = 9;
         }
 
+        String cellBorder = "-fx-border-color: #9e9e9e; -fx-border-width: 0.7;";
+
         for (int c = 0; c < colHeaders.length; c++) {
             Label lbl = new Label(colHeaders[c]);
             lbl.setMaxWidth(Double.MAX_VALUE);
             lbl.setAlignment(Pos.CENTER);
-            String bg = (c == breakCol || c == zoharCol) ? "#455a64" : "#1a237e";
+            String bg = (c == breakCol || c == zoharCol) ? "#eceff1" : "#e8eaf6";
             lbl.setStyle("-fx-background-color: " + bg
-                    + "; -fx-text-fill: white; -fx-font-weight: bold; -fx-padding: 6; -fx-font-size: 11px;");
-            timetableGrid.add(lbl, c, 0);
+                    + "; -fx-text-fill: #000000; -fx-font-weight: bold; -fx-padding: 6; -fx-font-size: 11px; "
+                    + cellBorder);
+            targetGrid.add(lbl, c, 0);
         }
 
         String[] days = { "MON", "TUE", "WED", "THU", "FRI" };
@@ -704,70 +800,111 @@ public class MainApp extends Application {
             dayLbl.setMaxSize(Double.MAX_VALUE, Double.MAX_VALUE);
             dayLbl.setAlignment(Pos.CENTER);
             dayLbl.setStyle(
-                    "-fx-background-color: #ffffff; -fx-text-fill: #000000; -fx-font-weight: bold; -fx-padding: 8;");
-            timetableGrid.add(dayLbl, 0, r + 1);
+                    "-fx-background-color: #ffffff; -fx-text-fill: #000000; -fx-font-weight: bold; -fx-padding: 8; "
+                            + cellBorder);
+            targetGrid.add(dayLbl, 0, r + 1);
 
             Label breakCell = new Label("FRI".equals(day) ? "-" : "B\nR\nE\nA\nK");
             breakCell.setAlignment(Pos.CENTER);
-            breakCell.setPrefSize(52, 84);
+            breakCell.setPrefSize(52, 78);
             breakCell.setStyle(
-                    "-fx-background-color: #ffffff; -fx-font-weight: bold; -fx-font-size: 10px; -fx-text-fill: #000000;");
-            timetableGrid.add(breakCell, breakCol, r + 1);
+                    "-fx-background-color: #ffffff; -fx-font-weight: bold; -fx-font-size: 10px; -fx-text-fill: #000000; "
+                            + cellBorder);
+            targetGrid.add(breakCell, breakCol, r + 1);
 
             Label zoharCell = new Label("FRI".equals(day) ? "-" : "Zohar\nPrayer\nBreak");
             zoharCell.setAlignment(Pos.CENTER);
-            zoharCell.setPrefSize(58, 84);
+            zoharCell.setPrefSize(58, 78);
             zoharCell.setStyle(
-                    "-fx-background-color: #ffffff; -fx-font-weight: bold; -fx-font-size: 10px; -fx-text-fill: #000000;");
-            timetableGrid.add(zoharCell, zoharCol, r + 1);
+                    "-fx-background-color: #ffffff; -fx-font-weight: bold; -fx-font-size: 10px; -fx-text-fill: #000000; "
+                            + cellBorder);
+            targetGrid.add(zoharCell, zoharCol, r + 1);
 
             for (int p = 1; p <= 7; p++) {
                 Label cell = new Label("-");
                 cell.setWrapText(true);
-                cell.setPrefSize(145, 84);
+                cell.setPrefSize(145, 78);
                 cell.setAlignment(Pos.CENTER);
                 cell.setStyle(
-                        "-fx-background-color: #ffffff; -fx-padding: 4; -fx-font-size: 11px; -fx-text-fill: #000000;");
+                        "-fx-background-color: #ffffff; -fx-padding: 4; -fx-font-size: 11px; -fx-text-fill: #000000; "
+                                + cellBorder);
 
-                // Seminar Slots: Tuesday 4th (1100-1150) & Wednesday 3rd + 4th -> Light Purple
-                // (#CE93D8)
                 if (("TUE".equals(day) && p == 4) || ("WED".equals(day) && (p == 3 || p == 4))) {
                     cell.setText("SEMINAR /\nCI (E) / HOD");
                     cell.setStyle(
-                            "-fx-background-color: #ce93d8; -fx-font-weight: bold; -fx-padding: 4; -fx-font-size: 11px; -fx-text-fill: #000000;");
+                            "-fx-background-color: #ce93d8; -fx-font-weight: bold; -fx-padding: 4; -fx-font-size: 11px; -fx-text-fill: #000000; "
+                                    + cellBorder);
                 } else if ("FRI".equals(day) && p == 6) {
                     cell.setText("Friday's\nPrayers");
                     cell.setStyle(
-                            "-fx-background-color: #ce93d8; -fx-font-weight: bold; -fx-padding: 4; -fx-font-size: 11px; -fx-text-fill: #000000;");
+                            "-fx-background-color: #ce93d8; -fx-font-weight: bold; -fx-padding: 4; -fx-font-size: 11px; -fx-text-fill: #000000; "
+                                    + cellBorder);
                 } else if ("FRI".equals(day) && p == 7) {
                     cell.setText("Library");
                     cell.setStyle(
-                            "-fx-background-color: #e0f7fa; -fx-font-weight: bold; -fx-padding: 4; -fx-font-size: 11px; -fx-text-fill: #000000;");
+                            "-fx-background-color: #e0f7fa; -fx-font-weight: bold; -fx-padding: 4; -fx-font-size: 11px; -fx-text-fill: #000000; "
+                                    + cellBorder);
                 }
 
-                timetableGrid.add(cell, periodToCol[p], r + 1);
+                targetGrid.add(cell, periodToCol[p], r + 1);
                 cellMap.put(day + "_" + p, cell);
             }
         }
 
-        String query = """
-                    SELECT ts.day_of_week, ts.period_no, c.course_title,
-                           CONCAT(f.rank_title, ' ', f.full_name) AS inst_name,
-                           CONCAT(le.rank_title, ' ', le.full_name) AS le_name,
-                           r.room_name, sch.session_type, sch.is_rescheduled
-                    FROM timetable_schedule sch
-                    JOIN time_slots ts ON sch.slot_id = ts.slot_id
-                    JOIN course_allocations ca ON sch.allocation_id = ca.allocation_id
-                    JOIN courses c ON ca.course_id = c.course_id
-                    JOIN faculty f ON sch.instructor_id = f.faculty_id
-                    LEFT JOIN faculty le ON sch.lab_engineer_id = le.faculty_id
-                    LEFT JOIN rooms r ON sch.room_id = r.room_id
-                    WHERE sch.section_id = ? AND sch.semester_term = 'Fall-2026'
-                """;
+        // Load Master Slots (excluding vacated slots if rendering Weekly View)
+        String query = includeWeeklyOverrides
+                ? """
+                        SELECT ts.day_of_week, ts.period_no, c.course_title,
+                               CONCAT(f.rank_title, ' ', f.full_name) AS inst_name,
+                               CONCAT(le.rank_title, ' ', le.full_name) AS le_name,
+                               r.room_name, sch.session_type, FALSE AS is_weekly_moved
+                        FROM timetable_schedule sch
+                        JOIN time_slots ts ON sch.slot_id = ts.slot_id
+                        JOIN course_allocations ca ON sch.allocation_id = ca.allocation_id
+                        JOIN courses c ON ca.course_id = c.course_id
+                        JOIN faculty f ON sch.instructor_id = f.faculty_id
+                        LEFT JOIN faculty le ON sch.lab_engineer_id = le.faculty_id
+                        LEFT JOIN rooms r ON sch.room_id = r.room_id
+                        WHERE sch.section_id = ? AND sch.semester_term = 'Fall-2026'
+                        AND sch.slot_id NOT IN (
+                            SELECT original_slot_id FROM weekly_rescheduled_schedule
+                            WHERE section_id = ? AND semester_term = 'Fall-2026'
+                        )
+                        UNION ALL
+                        SELECT ts.day_of_week, ts.period_no, c.course_title,
+                               CONCAT(f.rank_title, ' ', f.full_name) AS inst_name,
+                               '-' AS le_name,
+                               r.room_name, wr.session_type, TRUE AS is_weekly_moved
+                        FROM weekly_rescheduled_schedule wr
+                        JOIN time_slots ts ON wr.new_slot_id = ts.slot_id
+                        JOIN course_allocations ca ON wr.allocation_id = ca.allocation_id
+                        JOIN courses c ON ca.course_id = c.course_id
+                        JOIN faculty f ON wr.instructor_id = f.faculty_id
+                        LEFT JOIN rooms r ON wr.room_id = r.room_id
+                        WHERE wr.section_id = ? AND wr.semester_term = 'Fall-2026'
+                        """
+                : """
+                        SELECT ts.day_of_week, ts.period_no, c.course_title,
+                               CONCAT(f.rank_title, ' ', f.full_name) AS inst_name,
+                               CONCAT(le.rank_title, ' ', le.full_name) AS le_name,
+                               r.room_name, sch.session_type, FALSE AS is_weekly_moved
+                        FROM timetable_schedule sch
+                        JOIN time_slots ts ON sch.slot_id = ts.slot_id
+                        JOIN course_allocations ca ON sch.allocation_id = ca.allocation_id
+                        JOIN courses c ON ca.course_id = c.course_id
+                        JOIN faculty f ON sch.instructor_id = f.faculty_id
+                        LEFT JOIN faculty le ON sch.lab_engineer_id = le.faculty_id
+                        LEFT JOIN rooms r ON sch.room_id = r.room_id
+                        WHERE sch.section_id = ? AND sch.semester_term = 'Fall-2026'
+                        """;
 
         try (Connection conn = DatabaseConnection.getConnection();
                 PreparedStatement ps = conn.prepareStatement(query)) {
             ps.setInt(1, sectionId);
+            if (includeWeeklyOverrides) {
+                ps.setInt(2, sectionId);
+                ps.setInt(3, sectionId);
+            }
             ResultSet rs = ps.executeQuery();
             while (rs.next()) {
                 Label cell = cellMap.get(rs.getString("day_of_week") + "_" + rs.getInt("period_no"));
@@ -776,26 +913,25 @@ public class MainApp extends Application {
                     String course = rs.getString("course_title");
                     String inst = rs.getString("inst_name");
                     String room = rs.getString("room_name");
-                    boolean isResched = rs.getBoolean("is_rescheduled");
-                    String tag = isResched ? " [RESCHEDULED]" : "";
+                    boolean isWeeklyMoved = rs.getBoolean("is_weekly_moved");
+                    String tag = isWeeklyMoved ? " [RESCHEDULED]" : "";
 
                     if ("STI".equals(type)) {
-                        // STI Specific Color: Warm Orange (#FFBB00) matching image
                         cell.setText("STI" + tag + "\n" + inst);
                         cell.setStyle(
-                                "-fx-background-color: #ffbb00; -fx-padding: 4; -fx-font-size: 11px; -fx-font-weight: bold; -fx-text-fill: #000000;");
+                                "-fx-background-color: #ffbb00; -fx-padding: 4; -fx-font-size: 11px; -fx-font-weight: bold; -fx-text-fill: #000000; "
+                                        + cellBorder);
                     } else if ("LAB".equals(type)) {
-                        // LAB Specific Color: Bright Yellow (#FFEE00) matching image
-                        cell.setText(course + " (LAB)" + tag + "\n" + inst + " / " + rs.getString("le_name") + "\n("
-                                + room + ")");
+                        String lePart = (rs.getString("le_name") != null) ? " / " + rs.getString("le_name") : "";
+                        cell.setText(course + " (LAB)" + tag + "\n" + inst + lePart + "\n(" + room + ")");
                         cell.setStyle(
-                                "-fx-background-color: #ffee00; -fx-font-weight: bold; -fx-padding: 4; -fx-font-size: 10px; -fx-text-fill: #000000;");
+                                "-fx-background-color: #ffee00; -fx-font-weight: bold; -fx-padding: 4; -fx-font-size: 10px; -fx-text-fill: #000000; "
+                                        + cellBorder);
                     } else {
-                        // Theory Class: Clean White (#FFFFFF)
                         cell.setText(course + tag + "\n" + inst + "\n(" + room + ")");
-                        String bg = isResched ? "#f8bbd0" : "#ffffff";
+                        String bg = isWeeklyMoved ? "#f8bbd0" : "#ffffff";
                         cell.setStyle("-fx-background-color: " + bg
-                                + "; -fx-padding: 4; -fx-font-size: 11px; -fx-text-fill: #000000;");
+                                + "; -fx-padding: 4; -fx-font-size: 11px; -fx-text-fill: #000000; " + cellBorder);
                     }
                 }
             }
@@ -805,7 +941,7 @@ public class MainApp extends Application {
     }
 
     // ========================================================================
-    // DATA LOADERS & HELPERS
+    // DATA LOADERS & CSV EXPORTER
     // ========================================================================
     private void refreshAllDropdownsAndTables() {
         loadSections();
@@ -815,6 +951,7 @@ public class MainApp extends Application {
         loadAllocationsTable();
         populateLookupEntities();
         loadFreeInstructors(new Label());
+        renderWeeklyTimetableForSection();
     }
 
     private void refreshTab1Grid() {
@@ -952,7 +1089,8 @@ public class MainApp extends Application {
                         JOIN faculty f ON sch.instructor_id = f.faculty_id
                         LEFT JOIN faculty le ON sch.lab_engineer_id = le.faculty_id
                         LEFT JOIN rooms r ON sch.room_id = r.room_id
-                        WHERE CONCAT(f.rank_title, ' ', f.full_name) = ? OR CONCAT(le.rank_title, ' ', le.full_name) = ?
+                        WHERE (CONCAT(f.rank_title, ' ', f.full_name) = ? AND sch.session_type IN ('THEORY', 'STI'))
+                           OR (CONCAT(le.rank_title, ' ', le.full_name) = ? AND sch.session_type = 'LAB')
                         ORDER BY FIELD(ts.day_of_week,'MON','TUE','WED','THU','FRI'), ts.period_no
                         """
                 : """
@@ -1024,31 +1162,71 @@ public class MainApp extends Application {
         alert.showAndWait();
     }
 
-    private void exportSectionToCSV(int sectionId, String sectionName, File file) {
-        String sql = """
-                    SELECT ts.day_of_week, ts.period_no, CONCAT(ts.start_time, '-', ts.end_time) AS timing,
-                           c.course_code, c.course_title, sch.session_type,
-                           CONCAT(f.rank_title, ' ', f.full_name) AS instructor,
-                           IFNULL(CONCAT(le.rank_title, ' ', le.full_name), '-') AS lab_engineer,
-                           IFNULL(r.room_name, 'N/A') AS room,
-                           IF(sch.is_rescheduled = TRUE, 'YES', 'NO') AS rescheduled
-                    FROM timetable_schedule sch
-                    JOIN time_slots ts ON sch.slot_id = ts.slot_id
-                    JOIN course_allocations ca ON sch.allocation_id = ca.allocation_id
-                    JOIN courses c ON ca.course_id = c.course_id
-                    JOIN faculty f ON sch.instructor_id = f.faculty_id
-                    LEFT JOIN faculty le ON sch.lab_engineer_id = le.faculty_id
-                    LEFT JOIN rooms r ON sch.room_id = r.room_id
-                    WHERE sch.section_id = ? AND sch.semester_term = 'Fall-2026'
-                    ORDER BY FIELD(ts.day_of_week,'MON','TUE','WED','THU','FRI'), ts.period_no
-                """;
+    private void exportSectionToCSV(int sectionId, String sectionName, File file, boolean isWeeklyRescheduled) {
+        String sql = isWeeklyRescheduled
+                ? """
+                        SELECT day_of_week, period_no, timing, course_code, course_title, session_type, instructor, lab_engineer, room, status FROM (
+                            SELECT ts.day_of_week, ts.period_no, CONCAT(ts.start_time, '-', ts.end_time) AS timing,
+                                   c.course_code, c.course_title, sch.session_type,
+                                   CONCAT(f.rank_title, ' ', f.full_name) AS instructor,
+                                   IFNULL(CONCAT(le.rank_title, ' ', le.full_name), '-') AS lab_engineer,
+                                   IFNULL(r.room_name, 'N/A') AS room, 'REGULAR' AS status
+                            FROM timetable_schedule sch
+                            JOIN time_slots ts ON sch.slot_id = ts.slot_id
+                            JOIN course_allocations ca ON sch.allocation_id = ca.allocation_id
+                            JOIN courses c ON ca.course_id = c.course_id
+                            JOIN faculty f ON sch.instructor_id = f.faculty_id
+                            LEFT JOIN faculty le ON sch.lab_engineer_id = le.faculty_id
+                            LEFT JOIN rooms r ON sch.room_id = r.room_id
+                            WHERE sch.section_id = ? AND sch.semester_term = 'Fall-2026'
+                            AND sch.slot_id NOT IN (
+                                SELECT original_slot_id FROM weekly_rescheduled_schedule
+                                WHERE section_id = ? AND semester_term = 'Fall-2026'
+                            )
+                            UNION ALL
+                            SELECT ts.day_of_week, ts.period_no, CONCAT(ts.start_time, '-', ts.end_time) AS timing,
+                                   c.course_code, c.course_title, wr.session_type,
+                                   CONCAT(f.rank_title, ' ', f.full_name) AS instructor,
+                                   '-' AS lab_engineer,
+                                   IFNULL(r.room_name, 'N/A') AS room, 'WEEKLY_RESCHEDULED' AS status
+                            FROM weekly_rescheduled_schedule wr
+                            JOIN time_slots ts ON wr.new_slot_id = ts.slot_id
+                            JOIN course_allocations ca ON wr.allocation_id = ca.allocation_id
+                            JOIN courses c ON ca.course_id = c.course_id
+                            JOIN faculty f ON wr.instructor_id = f.faculty_id
+                            LEFT JOIN rooms r ON wr.room_id = r.room_id
+                            WHERE wr.section_id = ? AND wr.semester_term = 'Fall-2026'
+                        ) combined
+                        ORDER BY FIELD(day_of_week,'MON','TUE','WED','THU','FRI'), period_no
+                        """
+                : """
+                        SELECT ts.day_of_week, ts.period_no, CONCAT(ts.start_time, '-', ts.end_time) AS timing,
+                               c.course_code, c.course_title, sch.session_type,
+                               CONCAT(f.rank_title, ' ', f.full_name) AS instructor,
+                               IFNULL(CONCAT(le.rank_title, ' ', le.full_name), '-') AS lab_engineer,
+                               IFNULL(r.room_name, 'N/A') AS room, 'MASTER' AS status
+                        FROM timetable_schedule sch
+                        JOIN time_slots ts ON sch.slot_id = ts.slot_id
+                        JOIN course_allocations ca ON sch.allocation_id = ca.allocation_id
+                        JOIN courses c ON ca.course_id = c.course_id
+                        JOIN faculty f ON sch.instructor_id = f.faculty_id
+                        LEFT JOIN faculty le ON sch.lab_engineer_id = le.faculty_id
+                        LEFT JOIN rooms r ON sch.room_id = r.room_id
+                        WHERE sch.section_id = ? AND sch.semester_term = 'Fall-2026'
+                        ORDER BY FIELD(ts.day_of_week,'MON','TUE','WED','THU','FRI'), ts.period_no
+                        """;
+
         try (Connection conn = DatabaseConnection.getConnection();
                 PreparedStatement ps = conn.prepareStatement(sql);
                 PrintWriter pw = new PrintWriter(file)) {
             ps.setInt(1, sectionId);
+            if (isWeeklyRescheduled) {
+                ps.setInt(2, sectionId);
+                ps.setInt(3, sectionId);
+            }
             ResultSet rs = ps.executeQuery();
             pw.println(
-                    "Section,Day,Period,Timing,Course Code,Course Title,Session Type,Instructor,Lab Engineer,Room,Rescheduled");
+                    "Section,Day,Period,Timing,Course Code,Course Title,Session Type,Instructor,Lab Engineer,Room,Schedule Status");
             while (rs.next()) {
                 pw.printf("\"%s\",\"%s\",%d,\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"%n",
                         sectionName, rs.getString(1), rs.getInt(2), rs.getString(3),

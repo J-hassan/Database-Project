@@ -47,7 +47,9 @@ public class TimetableGenerator {
         int scheduledCount = 0;
         List<String> warnings = new ArrayList<>();
 
-        try (Connection conn = DatabaseConnection.getConnection()) {
+        Connection conn = null;
+        try {
+            conn = DatabaseConnection.getConnection();
             conn.setAutoCommit(false);
 
             try (PreparedStatement del = conn
@@ -66,6 +68,10 @@ public class TimetableGenerator {
             List<Integer> generalSoftwareLabs = loadGeneralSoftwareLabs(conn);
 
             List<AllocationTask> tasks = loadAllocations(conn, semesterTerm);
+            if (tasks.isEmpty()) {
+                return new GenerationResult(1,
+                        "No course allocations found for " + semesterTerm + ". Please add allocations first.");
+            }
             tasks.sort((a, b) -> Integer.compare(b.labBlocksNeeded, a.labBlocksNeeded));
 
             String insertSQL = "INSERT INTO timetable_schedule " +
@@ -76,6 +82,8 @@ public class TimetableGenerator {
             try (PreparedStatement insertStmt = conn.prepareStatement(insertSQL)) {
 
                 // PHASE 1: SCHEDULE 3-CONSECUTIVE-SLOT LABS
+                // Theory instructor is FREE during labs; only Section + Lab Engineer + Lab Room
+                // must be free!
                 for (AllocationTask task : tasks) {
                     if (task.labBlocksNeeded > 0) {
                         List<Integer> candidateLabs = new ArrayList<>(
@@ -132,23 +140,49 @@ public class TimetableGenerator {
             conn.commit();
             if (warnings.isEmpty()) {
                 return new GenerationResult(0, "SUCCESS! Generated " + scheduledCount
-                        + " conflict-free class/lab/STI slots across all 14 sections with ZERO warnings.");
+                        + " conflict-free class/lab/STI slots across all sections with ZERO warnings.");
             } else {
                 return new GenerationResult(warnings.size(), "Generated " + scheduledCount + " slots with "
                         + warnings.size() + " warnings:\n" + String.join("\n", warnings));
             }
 
         } catch (SQLException e) {
-            e.printStackTrace();
-            return new GenerationResult(999, "DATABASE ERROR: " + e.getMessage());
+            if (conn != null) {
+                try {
+                    conn.rollback();
+                } catch (SQLException ignored) {
+                }
+            }
+            if (e.getMessage() != null && e.getMessage().contains("uq_no_instructor_clash")) {
+                return new GenerationResult(999,
+                        "DB Schema Update Needed: Run 'ALTER TABLE timetable_schedule DROP INDEX uq_no_instructor_clash;' in MySQL Workbench so theory instructors can remain free during lab blocks.");
+            }
+            return new GenerationResult(999, "Database Error: " + e.getMessage());
+        } catch (Exception e) {
+            if (conn != null) {
+                try {
+                    conn.rollback();
+                } catch (SQLException ignored) {
+                }
+            }
+            return new GenerationResult(999, "Unexpected Error: " + e.getMessage());
+        } finally {
+            if (conn != null) {
+                try {
+                    conn.close();
+                } catch (SQLException ignored) {
+                }
+            }
         }
     }
 
     // ========================================================================
-    // 1. MID-SEMESTER INSTRUCTOR REPLACEMENT (WITH AUTO-CLASH RESOLUTION)
+    // 1. MID-SEMESTER INSTRUCTOR REPLACEMENT
     // ========================================================================
     public String replaceInstructor(String semesterTerm, int allocationId, int newInstructorId) {
-        try (Connection conn = DatabaseConnection.getConnection()) {
+        Connection conn = null;
+        try {
+            conn = DatabaseConnection.getConnection();
             conn.setAutoCommit(false);
 
             int sectionId = 0;
@@ -173,12 +207,19 @@ public class TimetableGenerator {
                 updAlloc.executeUpdate();
             }
 
+            try (PreparedStatement updLabInst = conn.prepareStatement(
+                    "UPDATE timetable_schedule SET instructor_id = ? WHERE allocation_id = ? AND semester_term = ? AND session_type = 'LAB'")) {
+                updLabInst.setInt(1, newInstructorId);
+                updLabInst.setInt(2, allocationId);
+                updLabInst.setString(3, semesterTerm);
+                updLabInst.executeUpdate();
+            }
+
             List<int[]> nonLabSlots = new ArrayList<>();
             List<String> nonLabTypes = new ArrayList<>();
-            List<int[]> labSlots = new ArrayList<>();
 
-            String fetchSched = "SELECT schedule_id, slot_id, room_id, session_type, lab_engineer_id " +
-                    "FROM timetable_schedule WHERE allocation_id = ? AND semester_term = ? ORDER BY slot_id";
+            String fetchSched = "SELECT schedule_id, slot_id, room_id, session_type " +
+                    "FROM timetable_schedule WHERE allocation_id = ? AND semester_term = ? AND session_type <> 'LAB'";
             try (PreparedStatement ps = conn.prepareStatement(fetchSched)) {
                 ps.setInt(1, allocationId);
                 ps.setString(2, semesterTerm);
@@ -187,17 +228,8 @@ public class TimetableGenerator {
                     int rId = rs.getInt("room_id");
                     if (rs.wasNull())
                         rId = 0;
-                    int leId = rs.getInt("lab_engineer_id");
-                    if (rs.wasNull())
-                        leId = 0;
-                    String type = rs.getString("session_type");
-
-                    if ("LAB".equals(type)) {
-                        labSlots.add(new int[] { rs.getInt("schedule_id"), rs.getInt("slot_id"), rId, leId });
-                    } else {
-                        nonLabSlots.add(new int[] { rs.getInt("schedule_id"), rs.getInt("slot_id"), rId });
-                        nonLabTypes.add(type);
-                    }
+                    nonLabSlots.add(new int[] { rs.getInt("schedule_id"), rs.getInt("slot_id"), rId });
+                    nonLabTypes.add(rs.getString("session_type"));
                 }
             }
 
@@ -208,10 +240,9 @@ public class TimetableGenerator {
             for (int i = 0; i < nonLabSlots.size(); i++) {
                 int schedId = nonLabSlots.get(i)[0];
                 int slotId = nonLabSlots.get(i)[1];
-                int roomId = nonLabSlots.get(i)[2];
                 String type = nonLabTypes.get(i);
 
-                if (isPersonFreeInDB(conn, semesterTerm, slotId, newInstructorId)) {
+                if (isInstructorFreeForTheoryOrMeeting(conn, semesterTerm, slotId, newInstructorId)) {
                     try (PreparedStatement upd = conn.prepareStatement(
                             "UPDATE timetable_schedule SET instructor_id = ? WHERE schedule_id = ?")) {
                         upd.setInt(1, newInstructorId);
@@ -225,8 +256,8 @@ public class TimetableGenerator {
                         del.setInt(1, schedId);
                         del.executeUpdate();
                     }
-                    String movedSlot = relocateSingleSession(conn, semesterTerm, allocationId, sectionId,
-                            newInstructorId, roomId, type, true);
+                    String movedSlot = relocateMasterSession(conn, semesterTerm, allocationId, sectionId,
+                            newInstructorId, type);
                     if (movedSlot != null)
                         rescheduledCount++;
                     else
@@ -234,63 +265,39 @@ public class TimetableGenerator {
                 }
             }
 
-            if (!labSlots.isEmpty()) {
-                boolean allLabSlotsFree = true;
-                for (int[] ls : labSlots) {
-                    if (!isPersonFreeInDB(conn, semesterTerm, ls[1], newInstructorId)) {
-                        allLabSlotsFree = false;
-                        break;
-                    }
-                }
-
-                if (allLabSlotsFree) {
-                    for (int[] ls : labSlots) {
-                        try (PreparedStatement upd = conn.prepareStatement(
-                                "UPDATE timetable_schedule SET instructor_id = ? WHERE schedule_id = ?")) {
-                            upd.setInt(1, newInstructorId);
-                            upd.setInt(2, ls[0]);
-                            upd.executeUpdate();
-                            directTransferred++;
-                        }
-                    }
-                } else {
-                    int oldLabRoomId = labSlots.get(0)[2];
-                    int leId = labSlots.get(0)[3];
-                    for (int[] ls : labSlots) {
-                        try (PreparedStatement del = conn.prepareStatement(
-                                "DELETE FROM timetable_schedule WHERE schedule_id = ?")) {
-                            del.setInt(1, ls[0]);
-                            del.executeUpdate();
-                        }
-                    }
-                    boolean labMoved = relocateLabBlockInDB(conn, semesterTerm, allocationId, sectionId,
-                            newInstructorId, leId, oldLabRoomId);
-                    if (labMoved)
-                        rescheduledCount += labSlots.size();
-                    else
-                        unresolved.add("Could not auto-relocate 3-slot LAB block");
-                }
-            }
-
             conn.commit();
             String summary = "Instructor Replacement Complete for " + courseTitle + ":\n" +
-                    "• Direct Clash-Free Transfers: " + directTransferred + " slots\n" +
-                    "• Auto-Rescheduled (due to new instructor's clash): " + rescheduledCount + " slots";
+                    "• Direct Clash-Free Transfers: " + directTransferred + " theory/STI slots\n" +
+                    "• Auto-Rescheduled (due to clash): " + rescheduledCount + " slots";
             if (!unresolved.isEmpty())
                 summary += "\n• Warnings: " + String.join(", ", unresolved);
             return summary;
 
-        } catch (SQLException e) {
-            e.printStackTrace();
-            return "DATABASE ERROR: " + e.getMessage();
+        } catch (Exception e) {
+            if (conn != null) {
+                try {
+                    conn.rollback();
+                } catch (SQLException ignored) {
+                }
+            }
+            return "Operation Failed: " + e.getMessage();
+        } finally {
+            if (conn != null) {
+                try {
+                    conn.close();
+                } catch (SQLException ignored) {
+                }
+            }
         }
     }
 
     // ========================================================================
-    // 2. MID-SEMESTER LAB ENGINEER (LE) REPLACEMENT
+    // 2. MID-SEMESTER LAB ENGINEER (LE) REPLACEMENT & REMOVAL
     // ========================================================================
     public String replaceLabEngineer(String semesterTerm, int allocationId, int newLeId) {
-        try (Connection conn = DatabaseConnection.getConnection()) {
+        Connection conn = null;
+        try {
+            conn = DatabaseConnection.getConnection();
             conn.setAutoCommit(false);
 
             int sectionId = 0, instructorId = 0;
@@ -309,7 +316,6 @@ public class TimetableGenerator {
                 }
             }
 
-            // Update master allocation
             try (PreparedStatement updAlloc = conn.prepareStatement(
                     "UPDATE course_allocations SET lab_engineer_id = ? WHERE allocation_id = ?")) {
                 updAlloc.setInt(1, newLeId);
@@ -317,8 +323,7 @@ public class TimetableGenerator {
                 updAlloc.executeUpdate();
             }
 
-            // Fetch existing LAB slots
-            List<int[]> labSlots = new ArrayList<>(); // [schedule_id, slot_id, room_id]
+            List<int[]> labSlots = new ArrayList<>();
             String fetchLabs = "SELECT schedule_id, slot_id, room_id FROM timetable_schedule " +
                     "WHERE allocation_id = ? AND semester_term = ? AND session_type = 'LAB' ORDER BY slot_id";
             try (PreparedStatement ps = conn.prepareStatement(fetchLabs)) {
@@ -332,13 +337,12 @@ public class TimetableGenerator {
 
             if (labSlots.isEmpty()) {
                 conn.commit();
-                return "Lab Engineer updated in allocation record (No scheduled LAB slots existed for " + courseTitle
-                        + ").";
+                return "Lab Engineer updated in allocation record for " + courseTitle + ".";
             }
 
             boolean allFree = true;
             for (int[] ls : labSlots) {
-                if (!isPersonFreeInDB(conn, semesterTerm, ls[1], newLeId)) {
+                if (!isInstructorFreeForTheoryOrMeeting(conn, semesterTerm, ls[1], newLeId)) {
                     allFree = false;
                     break;
                 }
@@ -370,32 +374,81 @@ public class TimetableGenerator {
                 conn.commit();
                 if (moved) {
                     return "SUCCESS! New Lab Engineer had a clash in the old slot, so the 3-slot Lab block for "
-                            + courseTitle + " was automatically moved to a new conflict-free slot.";
+                            + courseTitle + " was moved to a new conflict-free slot.";
                 } else {
-                    return "WARNING: Could not find 3 consecutive free slots for the new Lab Engineer and Instructor together.";
+                    return "WARNING: Could not find 3 consecutive free slots for the new Lab Engineer.";
                 }
             }
 
-        } catch (SQLException e) {
-            e.printStackTrace();
-            return "DATABASE ERROR: " + e.getMessage();
+        } catch (Exception e) {
+            if (conn != null) {
+                try {
+                    conn.rollback();
+                } catch (SQLException ignored) {
+                }
+            }
+            return "Operation Failed: " + e.getMessage();
+        } finally {
+            if (conn != null) {
+                try {
+                    conn.close();
+                } catch (SQLException ignored) {
+                }
+            }
+        }
+    }
+
+    public String removeLabEngineer(String semesterTerm, int allocationId) {
+        Connection conn = null;
+        try {
+            conn = DatabaseConnection.getConnection();
+            conn.setAutoCommit(false);
+            try (PreparedStatement ps1 = conn.prepareStatement(
+                    "UPDATE course_allocations SET lab_engineer_id = NULL WHERE allocation_id = ?")) {
+                ps1.setInt(1, allocationId);
+                ps1.executeUpdate();
+            }
+            try (PreparedStatement ps2 = conn.prepareStatement(
+                    "UPDATE timetable_schedule SET lab_engineer_id = NULL WHERE allocation_id = ? AND semester_term = ?")) {
+                ps2.setInt(1, allocationId);
+                ps2.setString(2, semesterTerm);
+                ps2.executeUpdate();
+            }
+            conn.commit();
+            return "SUCCESS! Lab Engineer has been removed from the selected course allocation and schedule.";
+        } catch (Exception e) {
+            if (conn != null) {
+                try {
+                    conn.rollback();
+                } catch (SQLException ignored) {
+                }
+            }
+            return "Operation Failed: " + e.getMessage();
+        } finally {
+            if (conn != null) {
+                try {
+                    conn.close();
+                } catch (SQLException ignored) {
+                }
+            }
         }
     }
 
     // ========================================================================
-    // 3. RESCHEDULE SINGLE CLASS FOR A SECTION & TEACHER (WITH CLASH & DUPLICATE
-    // CHECK)
+    // 3. WEEKLY RESCHEDULE (DOES NOT TOUCH PERMANENT MASTER TIMETABLE!)
     // ========================================================================
-    public String rescheduleSingleClass(String semesterTerm, int scheduleId) {
-        try (Connection conn = DatabaseConnection.getConnection()) {
+    public String rescheduleClassForWeekOnly(String semesterTerm, int scheduleId) {
+        Connection conn = null;
+        try {
+            conn = DatabaseConnection.getConnection();
             conn.setAutoCommit(false);
 
-            int allocId = 0, sectionId = 0, instId = 0, roomId = 0;
+            int allocId = 0, sectionId = 0, instId = 0, origSlotId = 0;
             String oldDay = "", sessionType = "", courseTitle = "", secName = "";
             int oldPeriod = 0;
 
             String fetchSql = """
-                        SELECT sch.allocation_id, sch.section_id, sch.instructor_id, IFNULL(sch.room_id, 0) AS r_id,
+                        SELECT sch.allocation_id, sch.section_id, sch.instructor_id, sch.slot_id,
                                sch.session_type, ts.day_of_week, ts.period_no, c.course_title,
                                CONCAT(p.program_code, '-', bs.batch_no, ' ', bs.section_name) AS sec_lbl
                         FROM timetable_schedule sch
@@ -413,7 +466,7 @@ public class TimetableGenerator {
                     allocId = rs.getInt("allocation_id");
                     sectionId = rs.getInt("section_id");
                     instId = rs.getInt("instructor_id");
-                    roomId = rs.getInt("r_id");
+                    origSlotId = rs.getInt("slot_id");
                     sessionType = rs.getString("session_type");
                     oldDay = rs.getString("day_of_week");
                     oldPeriod = rs.getInt("period_no");
@@ -425,75 +478,212 @@ public class TimetableGenerator {
             }
 
             if ("LAB".equals(sessionType)) {
-                return "NOTE: Selected session is a 3-hour LAB block. Please use Lab Engineer / Instructor replacement or full regeneration for 3-hour labs.";
+                return "NOTE: 3-hour Lab blocks cannot be single-slot rescheduled here. Select a Theory or STI class.";
             }
 
-            // Check if there are ALREADY rescheduled classes in this section (for
-            // transparency/warning)
-            List<String> existingRescheduledInfo = new ArrayList<>();
-            String checkExistingResched = """
+            try (PreparedStatement chkDup = conn.prepareStatement(
+                    "SELECT COUNT(*) FROM weekly_rescheduled_schedule WHERE semester_term = ? AND section_id = ? AND original_slot_id = ?")) {
+                chkDup.setString(1, semesterTerm);
+                chkDup.setInt(2, sectionId);
+                chkDup.setInt(3, origSlotId);
+                ResultSet rs = chkDup.executeQuery();
+                if (rs.next() && rs.getInt(1) > 0) {
+                    return "WARNING: This class (" + courseTitle + " on " + oldDay + " P" + oldPeriod
+                            + ") is ALREADY rescheduled in this week's timetable!";
+                }
+            }
+
+            List<String> existingWeeklyMoves = new ArrayList<>();
+            String listMovesSql = """
                         SELECT ts.day_of_week, ts.period_no, c.course_title, CONCAT(f.rank_title, ' ', f.full_name) AS tname
-                        FROM timetable_schedule sch
-                        JOIN time_slots ts ON sch.slot_id = ts.slot_id
-                        JOIN course_allocations ca ON sch.allocation_id = ca.allocation_id
+                        FROM weekly_rescheduled_schedule wr
+                        JOIN time_slots ts ON wr.new_slot_id = ts.slot_id
+                        JOIN course_allocations ca ON wr.allocation_id = ca.allocation_id
                         JOIN courses c ON ca.course_id = c.course_id
-                        JOIN faculty f ON sch.instructor_id = f.faculty_id
-                        WHERE sch.section_id = ? AND sch.semester_term = ? AND sch.is_rescheduled = TRUE
+                        JOIN faculty f ON wr.instructor_id = f.faculty_id
+                        WHERE wr.section_id = ? AND wr.semester_term = ?
                     """;
-            try (PreparedStatement ps = conn.prepareStatement(checkExistingResched)) {
+            try (PreparedStatement ps = conn.prepareStatement(listMovesSql)) {
                 ps.setInt(1, sectionId);
                 ps.setString(2, semesterTerm);
                 ResultSet rs = ps.executeQuery();
                 while (rs.next()) {
-                    existingRescheduledInfo.add(rs.getString("day_of_week") + " Period " + rs.getInt("period_no") +
-                            " (" + rs.getString("course_title") + " - " + rs.getString("tname") + ")");
+                    existingWeeklyMoves.add(rs.getString("day_of_week") + " Period " + rs.getInt("period_no") +
+                            " -> " + rs.getString("course_title") + " (" + rs.getString("tname") + ")");
                 }
             }
 
-            // Remove old slot temporarily
-            try (PreparedStatement del = conn
-                    .prepareStatement("DELETE FROM timetable_schedule WHERE schedule_id = ?")) {
-                del.setInt(1, scheduleId);
-                del.executeUpdate();
+            List<TimeSlot> validSlots = loadValidMorningSlots(conn);
+            Collections.shuffle(validSlots);
+
+            TimeSlot chosenSlot = null;
+            Integer chosenRoomId = null;
+            String chosenRoomName = "Office/STI";
+
+            for (TimeSlot s : validSlots) {
+                if (s.slotId == origSlotId)
+                    continue;
+
+                String secPermSql = """
+                            SELECT COUNT(*) FROM timetable_schedule sch
+                            WHERE sch.semester_term = ? AND sch.section_id = ? AND sch.slot_id = ?
+                            AND sch.slot_id NOT IN (
+                                SELECT original_slot_id FROM weekly_rescheduled_schedule
+                                WHERE semester_term = ? AND section_id = ?
+                            )
+                        """;
+                try (PreparedStatement ps = conn.prepareStatement(secPermSql)) {
+                    ps.setString(1, semesterTerm);
+                    ps.setInt(2, sectionId);
+                    ps.setInt(3, s.slotId);
+                    ps.setString(4, semesterTerm);
+                    ps.setInt(5, sectionId);
+                    ResultSet rs = ps.executeQuery();
+                    if (rs.next() && rs.getInt(1) > 0)
+                        continue;
+                }
+
+                String secWeekSql = "SELECT COUNT(*) FROM weekly_rescheduled_schedule WHERE semester_term = ? AND section_id = ? AND new_slot_id = ?";
+                try (PreparedStatement ps = conn.prepareStatement(secWeekSql)) {
+                    ps.setString(1, semesterTerm);
+                    ps.setInt(2, sectionId);
+                    ps.setInt(3, s.slotId);
+                    ResultSet rs = ps.executeQuery();
+                    if (rs.next() && rs.getInt(1) > 0)
+                        continue;
+                }
+
+                if (!isInstructorFreeForTheoryOrMeeting(conn, semesterTerm, s.slotId, instId))
+                    continue;
+
+                String instWeekSql = "SELECT COUNT(*) FROM weekly_rescheduled_schedule WHERE semester_term = ? AND instructor_id = ? AND new_slot_id = ?";
+                try (PreparedStatement ps = conn.prepareStatement(instWeekSql)) {
+                    ps.setString(1, semesterTerm);
+                    ps.setInt(2, instId);
+                    ps.setInt(3, s.slotId);
+                    ResultSet rs = ps.executeQuery();
+                    if (rs.next() && rs.getInt(1) > 0)
+                        continue;
+                }
+
+                if (!"STI".equals(sessionType)) {
+                    String roomSql = """
+                                SELECT r.room_id, r.room_name FROM rooms r
+                                WHERE r.room_type IN ('CLASSROOM', 'LECTURE_HALL')
+                                AND r.room_id NOT IN (
+                                    SELECT room_id FROM timetable_schedule
+                                    WHERE semester_term = ? AND slot_id = ? AND room_id IS NOT NULL
+                                )
+                                AND r.room_id NOT IN (
+                                    SELECT room_id FROM weekly_rescheduled_schedule
+                                    WHERE semester_term = ? AND new_slot_id = ? AND room_id IS NOT NULL
+                                ) LIMIT 1
+                            """;
+                    try (PreparedStatement ps = conn.prepareStatement(roomSql)) {
+                        ps.setString(1, semesterTerm);
+                        ps.setInt(2, s.slotId);
+                        ps.setString(3, semesterTerm);
+                        ps.setInt(4, s.slotId);
+                        ResultSet rs = ps.executeQuery();
+                        if (rs.next()) {
+                            chosenRoomId = rs.getInt("room_id");
+                            chosenRoomName = rs.getString("room_name");
+                        } else {
+                            continue;
+                        }
+                    }
+                }
+
+                chosenSlot = s;
+                break;
             }
 
-            // Find new clash-free slot (ensuring section doesn't already have another
-            // teacher/rescheduled class there)
-            String newSlotDesc = relocateSingleSession(conn, semesterTerm, allocId, sectionId, instId, roomId,
-                    sessionType, true);
-            if (newSlotDesc == null) {
+            if (chosenSlot == null) {
                 conn.rollback();
-                return "FAILED: No mutual free slot found where both " + secName
-                        + " and the instructor are free without clashing with another teacher.";
+                return "FAILED: No mutual free slot found for " + secName
+                        + " and the instructor without overlapping another class.";
+            }
+
+            String insSql = """
+                        INSERT INTO weekly_rescheduled_schedule
+                        (semester_term, section_id, allocation_id, original_slot_id, new_slot_id, instructor_id, room_id, session_type)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """;
+            try (PreparedStatement ps = conn.prepareStatement(insSql)) {
+                ps.setString(1, semesterTerm);
+                ps.setInt(2, sectionId);
+                ps.setInt(3, allocId);
+                ps.setInt(4, origSlotId);
+                ps.setInt(5, chosenSlot.slotId);
+                ps.setInt(6, instId);
+                if (chosenRoomId != null)
+                    ps.setInt(7, chosenRoomId);
+                else
+                    ps.setNull(7, Types.INTEGER);
+                ps.setString(8, sessionType);
+                ps.executeUpdate();
             }
 
             conn.commit();
 
             StringBuilder sb = new StringBuilder();
-            sb.append("RESCHEDULED SUCCESSFULLY!\n");
-            sb.append("• Section: ").append(secName).append(" | Subject: ").append(courseTitle).append(" (")
+            sb.append("WEEKLY RESCHEDULE CREATED (Permanent Master Timetable Untouched!):\n");
+            sb.append("• Section: ").append(secName).append(" | Course: ").append(courseTitle).append(" (")
                     .append(sessionType).append(")\n");
-            sb.append("• Moved From: ").append(oldDay).append(" Period ").append(oldPeriod).append("\n");
-            sb.append("• Moved To: ").append(newSlotDesc).append(" (Marked as [RESCHEDULED])\n");
-            sb.append("• Verified: No other teacher is assigned to ").append(secName).append(" in this slot.");
+            sb.append("• Vacated Slot: ").append(oldDay).append(" Period ").append(oldPeriod).append("\n");
+            sb.append("• New Weekly Slot: ").append(chosenSlot.dayOfWeek).append(" Period ").append(chosenSlot.periodNo)
+                    .append(" (").append(chosenSlot.startTime).append("-").append(chosenSlot.endTime).append(") in ")
+                    .append(chosenRoomName).append("\n");
+            sb.append("• Verified: Zero overlap with other teachers or existing rescheduled classes.");
 
-            if (!existingRescheduledInfo.isEmpty()) {
-                sb.append("\n\n⚠️ Notice (Other Previously Rescheduled Classes in ").append(secName).append("):\n");
-                for (String info : existingRescheduledInfo) {
-                    sb.append("   - ").append(info).append("\n");
-                }
+            if (!existingWeeklyMoves.isEmpty()) {
+                sb.append("\n\nOther Active Weekly Reschedules in ").append(secName).append(":\n");
+                for (String m : existingWeeklyMoves)
+                    sb.append("   - ").append(m).append("\n");
             }
             return sb.toString();
 
-        } catch (SQLException e) {
-            e.printStackTrace();
-            return "DATABASE ERROR: " + e.getMessage();
+        } catch (Exception e) {
+            if (conn != null) {
+                try {
+                    conn.rollback();
+                } catch (SQLException ignored) {
+                }
+            }
+            return "Reschedule Error: " + e.getMessage();
+        } finally {
+            if (conn != null) {
+                try {
+                    conn.close();
+                } catch (SQLException ignored) {
+                }
+            }
         }
     }
 
-    private boolean isPersonFreeInDB(Connection conn, String term, int slotId, int personId) throws SQLException {
-        String sql = "SELECT COUNT(*) FROM timetable_schedule WHERE semester_term = ? AND slot_id = ? " +
-                "AND (instructor_id = ? OR lab_engineer_id = ?)";
+    public String clearWeeklyReschedulesForSection(String semesterTerm, int sectionId) {
+        try (Connection conn = DatabaseConnection.getConnection();
+                PreparedStatement ps = conn.prepareStatement(
+                        "DELETE FROM weekly_rescheduled_schedule WHERE semester_term = ? AND section_id = ?")) {
+            ps.setString(1, semesterTerm);
+            ps.setInt(2, sectionId);
+            ps.executeUpdate();
+            return "SUCCESS";
+        } catch (Exception e) {
+            return "Error clearing weekly reschedules: " + e.getMessage();
+        }
+    }
+
+    private boolean isInstructorFreeForTheoryOrMeeting(Connection conn, String term, int slotId, int personId)
+            throws SQLException {
+        String sql = """
+                    SELECT COUNT(*) FROM timetable_schedule
+                    WHERE semester_term = ? AND slot_id = ?
+                    AND (
+                        (instructor_id = ? AND session_type IN ('THEORY', 'STI'))
+                        OR (lab_engineer_id = ? AND session_type = 'LAB')
+                    )
+                """;
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, term);
             ps.setInt(2, slotId);
@@ -504,32 +694,28 @@ public class TimetableGenerator {
         }
     }
 
-    private String relocateSingleSession(Connection conn, String term, int allocId, int sectionId,
-            int instId, int preferredRoomId, String type, boolean markRescheduled) throws SQLException {
+    private String relocateMasterSession(Connection conn, String term, int allocId, int sectionId,
+            int instId, String type) throws SQLException {
         List<TimeSlot> validSlots = loadValidMorningSlots(conn);
         Collections.shuffle(validSlots);
 
         for (TimeSlot s : validSlots) {
-            // Strict check: Neither the section (any teacher/rescheduled class) nor this
-            // teacher can be busy in slot s
-            String checkConflict = "SELECT COUNT(*) FROM timetable_schedule WHERE semester_term = ? AND slot_id = ? " +
-                    "AND (section_id = ? OR instructor_id = ? OR lab_engineer_id = ?)";
-            try (PreparedStatement ps = conn.prepareStatement(checkConflict)) {
+            String checkSec = "SELECT COUNT(*) FROM timetable_schedule WHERE semester_term = ? AND slot_id = ? AND section_id = ?";
+            try (PreparedStatement ps = conn.prepareStatement(checkSec)) {
                 ps.setString(1, term);
                 ps.setInt(2, s.slotId);
                 ps.setInt(3, sectionId);
-                ps.setInt(4, instId);
-                ps.setInt(5, instId);
                 ResultSet rs = ps.executeQuery();
                 if (rs.next() && rs.getInt(1) > 0)
                     continue;
             }
+            if (!isInstructorFreeForTheoryOrMeeting(conn, term, s.slotId, instId))
+                continue;
 
             Integer chosenRoom = null;
-            String roomName = "Office/STI";
             if (!"STI".equals(type)) {
                 String roomQuery = """
-                            SELECT r.room_id, r.room_name FROM rooms r
+                            SELECT r.room_id FROM rooms r
                             WHERE r.room_type IN ('CLASSROOM', 'LECTURE_HALL')
                             AND r.room_id NOT IN (
                                 SELECT room_id FROM timetable_schedule
@@ -540,19 +726,17 @@ public class TimetableGenerator {
                     ps.setString(1, term);
                     ps.setInt(2, s.slotId);
                     ResultSet rs = ps.executeQuery();
-                    if (rs.next()) {
+                    if (rs.next())
                         chosenRoom = rs.getInt("room_id");
-                        roomName = rs.getString("room_name");
-                    } else {
+                    else
                         continue;
-                    }
                 }
             }
 
             String ins = "INSERT INTO timetable_schedule " +
-                    "(semester_term, allocation_id, slot_id, section_id, instructor_id, lab_engineer_id, room_id, session_type, is_rescheduled, reschedule_note) "
+                    "(semester_term, allocation_id, slot_id, section_id, instructor_id, lab_engineer_id, room_id, session_type) "
                     +
-                    "VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)";
+                    "VALUES (?, ?, ?, ?, ?, NULL, ?, ?)";
             try (PreparedStatement ps = conn.prepareStatement(ins)) {
                 ps.setString(1, term);
                 ps.setInt(2, allocId);
@@ -564,11 +748,8 @@ public class TimetableGenerator {
                 else
                     ps.setNull(6, Types.INTEGER);
                 ps.setString(7, type);
-                ps.setBoolean(8, markRescheduled);
-                ps.setString(9, markRescheduled ? "Rescheduled Slot" : null);
                 ps.executeUpdate();
-                return s.dayOfWeek + " Period " + s.periodNo + " (" + s.startTime + "-" + s.endTime + ") in "
-                        + roomName;
+                return s.dayOfWeek + " P" + s.periodNo;
             }
         }
         return null;
@@ -589,21 +770,20 @@ public class TimetableGenerator {
 
                 boolean peopleOk = true;
                 for (TimeSlot s : new TimeSlot[] { s1, s2, s3 }) {
-                    String q = "SELECT COUNT(*) FROM timetable_schedule WHERE semester_term = ? AND slot_id = ? " +
-                            "AND (section_id = ? OR instructor_id = ? OR lab_engineer_id = ? OR instructor_id = ? OR lab_engineer_id = ?)";
+                    String q = "SELECT COUNT(*) FROM timetable_schedule WHERE semester_term = ? AND slot_id = ? AND section_id = ?";
                     try (PreparedStatement ps = conn.prepareStatement(q)) {
                         ps.setString(1, term);
                         ps.setInt(2, s.slotId);
                         ps.setInt(3, sectionId);
-                        ps.setInt(4, instId);
-                        ps.setInt(5, instId);
-                        ps.setInt(6, leId);
-                        ps.setInt(7, leId);
                         ResultSet rs = ps.executeQuery();
                         if (rs.next() && rs.getInt(1) > 0) {
                             peopleOk = false;
                             break;
                         }
+                    }
+                    if (leId > 0 && !isInstructorFreeForTheoryOrMeeting(conn, term, s.slotId, leId)) {
+                        peopleOk = false;
+                        break;
                     }
                 }
                 if (!peopleOk)
@@ -620,9 +800,9 @@ public class TimetableGenerator {
                         ResultSet rs = ps.executeQuery();
                         if (rs.next() && rs.getInt(1) == 0) {
                             String ins = "INSERT INTO timetable_schedule " +
-                                    "(semester_term, allocation_id, slot_id, section_id, instructor_id, lab_engineer_id, room_id, session_type, lab_group_tag, is_rescheduled) "
+                                    "(semester_term, allocation_id, slot_id, section_id, instructor_id, lab_engineer_id, room_id, session_type, lab_group_tag) "
                                     +
-                                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'LAB', ?, TRUE)";
+                                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'LAB', ?)";
                             for (TimeSlot s : new TimeSlot[] { s1, s2, s3 }) {
                                 try (PreparedStatement ips = conn.prepareStatement(ins)) {
                                     ips.setString(1, term);
@@ -648,7 +828,6 @@ public class TimetableGenerator {
         return false;
     }
 
-    // --- Core Generation Helpers ---
     private boolean scheduleLabBlock(PreparedStatement stmt, String term, AllocationTask task,
             Map<String, List<TimeSlot>> slotsByDay, List<Integer> candidateLabs) throws SQLException {
         List<String> days = new ArrayList<>(slotsByDay.keySet());
@@ -660,7 +839,8 @@ public class TimetableGenerator {
                 TimeSlot s1 = daySlots.get(i), s2 = daySlots.get(i + 1), s3 = daySlots.get(i + 2);
                 if (s2.periodNo != s1.periodNo + 1 || s3.periodNo != s2.periodNo + 1)
                     continue;
-                if (!isPeopleFree(s1.slotId, task) || !isPeopleFree(s2.slotId, task) || !isPeopleFree(s3.slotId, task))
+                if (!isLabPeopleFree(s1.slotId, task) || !isLabPeopleFree(s2.slotId, task)
+                        || !isLabPeopleFree(s3.slotId, task))
                     continue;
 
                 for (int labId : candidateLabs) {
@@ -668,7 +848,7 @@ public class TimetableGenerator {
                         String tag = "LAB_" + task.allocationId;
                         for (TimeSlot s : new TimeSlot[] { s1, s2, s3 }) {
                             addBatchRow(stmt, term, task, s.slotId, labId, "LAB", tag);
-                            markBusy(s.slotId, task, labId);
+                            markLabBusy(s.slotId, task, labId);
                         }
                         sectionCourseDays.add(task.sectionId + "_" + task.courseId + "_" + day);
                         return true;
@@ -722,8 +902,8 @@ public class TimetableGenerator {
         return false;
     }
 
-    private boolean isPeopleFree(int slotId, AllocationTask t) {
-        if (!isInstructorAndSectionFree(slotId, t))
+    private boolean isLabPeopleFree(int slotId, AllocationTask t) {
+        if (busySectionSlots.contains(slotId + "_" + t.sectionId))
             return false;
         return t.labEngineerId == null || !busyLESlots.contains(slotId + "_" + t.labEngineerId);
     }
@@ -737,10 +917,11 @@ public class TimetableGenerator {
         return !busyRoomSlots.contains(slotId + "_" + roomId);
     }
 
-    private void markBusy(int slotId, AllocationTask t, int roomId) {
-        markTheoryBusy(slotId, t, roomId);
+    private void markLabBusy(int slotId, AllocationTask t, int roomId) {
+        busySectionSlots.add(slotId + "_" + t.sectionId);
         if (t.labEngineerId != null)
             busyLESlots.add(slotId + "_" + t.labEngineerId);
+        busyRoomSlots.add(slotId + "_" + roomId);
     }
 
     private void markTheoryBusy(int slotId, AllocationTask t, int roomId) {
