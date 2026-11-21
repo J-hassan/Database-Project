@@ -15,13 +15,21 @@ public class TimetableGenerator {
     private final Set<String> busyRoomSlots = new HashSet<>();
     private final Set<String> sectionCourseDays = new HashSet<>();
 
+    // Rule 1: Track days where a section already has a Lab (Max 1 Lab per day per
+    // section)
+    private final Set<String> sectionLabDays = new HashSet<>();
+    // Rule 2: Track distinct courses per section per day (Max 3 different subjects
+    // per day per section)
+    private final Map<String, Set<Integer>> sectionDayDistinctCourses = new HashMap<>();
+
     public String generateForTerm(String semesterTerm) {
         String bestReport = "";
-        for (int attempt = 1; attempt <= 15; attempt++) {
+        for (int attempt = 1; attempt <= 25; attempt++) {
             GenerationResult res = runSingleAttempt(semesterTerm);
             bestReport = res.message;
             if (res.warningCount == 0) {
-                return res.message + " (Resolved in attempt #" + attempt + ")";
+                return res.message + " (Resolved in attempt #" + attempt
+                        + " | Max 1 Lab/Day, Max 3 Subjects/Day, Early-Period Priority)";
             }
         }
         return bestReport;
@@ -43,6 +51,8 @@ public class TimetableGenerator {
         busyLESlots.clear();
         busyRoomSlots.clear();
         sectionCourseDays.clear();
+        sectionLabDays.clear();
+        sectionDayDistinctCourses.clear();
 
         int scheduledCount = 0;
         List<String> warnings = new ArrayList<>();
@@ -81,9 +91,8 @@ public class TimetableGenerator {
 
             try (PreparedStatement insertStmt = conn.prepareStatement(insertSQL)) {
 
-                // PHASE 1: SCHEDULE 3-CONSECUTIVE-SLOT LABS
-                // Theory instructor is FREE during labs; only Section + Lab Engineer + Lab Room
-                // must be free!
+                // PHASE 1: SCHEDULE 3-CONSECUTIVE-SLOT LABS (Strictly Max 1 Lab Block Per Day
+                // Per Section)
                 for (AllocationTask task : tasks) {
                     if (task.labBlocksNeeded > 0) {
                         List<Integer> candidateLabs = new ArrayList<>(
@@ -105,15 +114,26 @@ public class TimetableGenerator {
                     }
                 }
 
-                // PHASE 2: SCHEDULE THEORY LECTURES
+                // PHASE 2: SCHEDULE THEORY LECTURES (Strict Max 3 Distinct Subjects Per Day +
+                // Early Periods First)
                 for (AllocationTask task : tasks) {
                     for (int i = 0; i < task.theorySlotsNeeded; i++) {
+                        // Pass 1: Different day for same course + Strict <= 3 distinct subjects/day
                         boolean placed = scheduleSingleTheory(insertStmt, semesterTerm, task, validSlots, regularRooms,
-                                false);
+                                false, true);
+                        // Pass 2: Allow same day for same course (doesn't increase distinct subject
+                        // count!) + Strict <= 3 distinct subjects/day
                         if (!placed) {
                             placed = scheduleSingleTheory(insertStmt, semesterTerm, task, validSlots, regularRooms,
-                                    true);
+                                    true, true);
                         }
+                        // Pass 3: Emergency fallback only if >3 subjects/day is mathematically
+                        // unavoidable for a heavy section
+                        if (!placed) {
+                            placed = scheduleSingleTheory(insertStmt, semesterTerm, task, validSlots, regularRooms,
+                                    true, false);
+                        }
+
                         if (placed) {
                             scheduledCount++;
                         } else {
@@ -122,7 +142,7 @@ public class TimetableGenerator {
                     }
                 }
 
-                // PHASE 3: SCHEDULE STI SLOTS
+                // PHASE 3: SCHEDULE STI SLOTS (Early Periods First)
                 for (AllocationTask task : tasks) {
                     for (int i = 0; i < task.stiSlotsNeeded; i++) {
                         boolean placed = scheduleSTI(insertStmt, semesterTerm, task, validSlots);
@@ -155,7 +175,7 @@ public class TimetableGenerator {
             }
             if (e.getMessage() != null && e.getMessage().contains("uq_no_instructor_clash")) {
                 return new GenerationResult(999,
-                        "DB Schema Update Needed: Run 'ALTER TABLE timetable_schedule DROP INDEX uq_no_instructor_clash;' in MySQL Workbench so theory instructors can remain free during lab blocks.");
+                        "DB Schema Update Needed: Run 'ALTER TABLE timetable_schedule DROP INDEX uq_no_instructor_clash;' in MySQL Workbench.");
             }
             return new GenerationResult(999, "Database Error: " + e.getMessage());
         } catch (Exception e) {
@@ -174,6 +194,45 @@ public class TimetableGenerator {
                 }
             }
         }
+    }
+
+    // ========================================================================
+    // HELPER: CHECK & REGISTER DISTINCT SUBJECTS PER DAY (MAX 3 PER DAY)
+    // ========================================================================
+    private boolean canAddCourseOnDay(int sectionId, String day, int courseId, boolean enforceMaxThree) {
+        if (!enforceMaxThree)
+            return true;
+        String key = sectionId + "_" + day;
+        Set<Integer> coursesToday = sectionDayDistinctCourses.computeIfAbsent(key, k -> new HashSet<>());
+        // If this course is ALREADY scheduled today (e.g., its Lab or 1st lecture),
+        // adding another slot of it does NOT increase distinct subject count!
+        if (coursesToday.contains(courseId)) {
+            return true;
+        }
+        return coursesToday.size() < 3;
+    }
+
+    private void registerCourseOnDay(int sectionId, String day, int courseId) {
+        String key = sectionId + "_" + day;
+        sectionDayDistinctCourses.computeIfAbsent(key, k -> new HashSet<>()).add(courseId);
+    }
+
+    private List<TimeSlot> getEarlyPrioritySlots(List<TimeSlot> validSlots) {
+        List<String> dayOrder = Arrays.asList("MON", "TUE", "WED", "THU", "FRI");
+        Collections.shuffle(dayOrder);
+        Map<String, Integer> dayRank = new HashMap<>();
+        for (int i = 0; i < dayOrder.size(); i++) {
+            dayRank.put(dayOrder.get(i), i);
+        }
+
+        List<TimeSlot> sorted = new ArrayList<>(validSlots);
+        sorted.sort((a, b) -> {
+            int pCmp = Integer.compare(a.periodNo, b.periodNo);
+            if (pCmp != 0)
+                return pCmp;
+            return Integer.compare(dayRank.getOrDefault(a.dayOfWeek, 0), dayRank.getOrDefault(b.dayOfWeek, 0));
+        });
+        return sorted;
     }
 
     // ========================================================================
@@ -435,7 +494,7 @@ public class TimetableGenerator {
     }
 
     // ========================================================================
-    // 3. WEEKLY RESCHEDULE (DOES NOT TOUCH PERMANENT MASTER TIMETABLE!)
+    // 3. WEEKLY RESCHEDULE (CAN USE EMPTY SLOTS OR SECTION'S STI SLOTS!)
     // ========================================================================
     public String rescheduleClassForWeekOnly(String semesterTerm, int scheduleId) {
         Connection conn = null;
@@ -513,94 +572,131 @@ public class TimetableGenerator {
                 }
             }
 
-            List<TimeSlot> validSlots = loadValidMorningSlots(conn);
-            Collections.shuffle(validSlots);
+            List<TimeSlot> validSlots = getEarlyPrioritySlots(loadValidMorningSlots(conn));
 
             TimeSlot chosenSlot = null;
             Integer chosenRoomId = null;
             String chosenRoomName = "Office/STI";
+            boolean usedStiSlot = false;
 
-            for (TimeSlot s : validSlots) {
-                if (s.slotId == origSlotId)
-                    continue;
+            // Pass 1: Look for completely FREE slots first (early periods prioritized)
+            // Pass 2: If no completely free slot is available, allow taking over one of
+            // this section's STI slots!
+            for (int pass = 1; pass <= 2 && chosenSlot == null; pass++) {
+                boolean allowUsingStiSlot = (pass == 2);
 
-                String secPermSql = """
-                            SELECT COUNT(*) FROM timetable_schedule sch
-                            WHERE sch.semester_term = ? AND sch.section_id = ? AND sch.slot_id = ?
-                            AND sch.slot_id NOT IN (
-                                SELECT original_slot_id FROM weekly_rescheduled_schedule
-                                WHERE semester_term = ? AND section_id = ?
-                            )
-                        """;
-                try (PreparedStatement ps = conn.prepareStatement(secPermSql)) {
-                    ps.setString(1, semesterTerm);
-                    ps.setInt(2, sectionId);
-                    ps.setInt(3, s.slotId);
-                    ps.setString(4, semesterTerm);
-                    ps.setInt(5, sectionId);
-                    ResultSet rs = ps.executeQuery();
-                    if (rs.next() && rs.getInt(1) > 0)
+                for (TimeSlot s : validSlots) {
+                    if (s.slotId == origSlotId)
                         continue;
-                }
 
-                String secWeekSql = "SELECT COUNT(*) FROM weekly_rescheduled_schedule WHERE semester_term = ? AND section_id = ? AND new_slot_id = ?";
-                try (PreparedStatement ps = conn.prepareStatement(secWeekSql)) {
-                    ps.setString(1, semesterTerm);
-                    ps.setInt(2, sectionId);
-                    ps.setInt(3, s.slotId);
-                    ResultSet rs = ps.executeQuery();
-                    if (rs.next() && rs.getInt(1) > 0)
-                        continue;
-                }
+                    // Check if section is busy in permanent schedule (excluding vacated slots, and
+                    // optionally excluding STI in Pass 2)
+                    String secPermSql = allowUsingStiSlot
+                            ? """
+                                    SELECT COUNT(*) FROM timetable_schedule sch
+                                    WHERE sch.semester_term = ? AND sch.section_id = ? AND sch.slot_id = ?
+                                    AND sch.session_type <> 'STI'
+                                    AND sch.slot_id NOT IN (
+                                        SELECT original_slot_id FROM weekly_rescheduled_schedule
+                                        WHERE semester_term = ? AND section_id = ?
+                                    )
+                                    """
+                            : """
+                                    SELECT COUNT(*) FROM timetable_schedule sch
+                                    WHERE sch.semester_term = ? AND sch.section_id = ? AND sch.slot_id = ?
+                                    AND sch.slot_id NOT IN (
+                                        SELECT original_slot_id FROM weekly_rescheduled_schedule
+                                        WHERE semester_term = ? AND section_id = ?
+                                    )
+                                    """;
 
-                if (!isInstructorFreeForTheoryOrMeeting(conn, semesterTerm, s.slotId, instId))
-                    continue;
-
-                String instWeekSql = "SELECT COUNT(*) FROM weekly_rescheduled_schedule WHERE semester_term = ? AND instructor_id = ? AND new_slot_id = ?";
-                try (PreparedStatement ps = conn.prepareStatement(instWeekSql)) {
-                    ps.setString(1, semesterTerm);
-                    ps.setInt(2, instId);
-                    ps.setInt(3, s.slotId);
-                    ResultSet rs = ps.executeQuery();
-                    if (rs.next() && rs.getInt(1) > 0)
-                        continue;
-                }
-
-                if (!"STI".equals(sessionType)) {
-                    String roomSql = """
-                                SELECT r.room_id, r.room_name FROM rooms r
-                                WHERE r.room_type IN ('CLASSROOM', 'LECTURE_HALL')
-                                AND r.room_id NOT IN (
-                                    SELECT room_id FROM timetable_schedule
-                                    WHERE semester_term = ? AND slot_id = ? AND room_id IS NOT NULL
-                                )
-                                AND r.room_id NOT IN (
-                                    SELECT room_id FROM weekly_rescheduled_schedule
-                                    WHERE semester_term = ? AND new_slot_id = ? AND room_id IS NOT NULL
-                                ) LIMIT 1
-                            """;
-                    try (PreparedStatement ps = conn.prepareStatement(roomSql)) {
+                    try (PreparedStatement ps = conn.prepareStatement(secPermSql)) {
                         ps.setString(1, semesterTerm);
-                        ps.setInt(2, s.slotId);
-                        ps.setString(3, semesterTerm);
-                        ps.setInt(4, s.slotId);
+                        ps.setInt(2, sectionId);
+                        ps.setInt(3, s.slotId);
+                        ps.setString(4, semesterTerm);
+                        ps.setInt(5, sectionId);
                         ResultSet rs = ps.executeQuery();
-                        if (rs.next()) {
-                            chosenRoomId = rs.getInt("room_id");
-                            chosenRoomName = rs.getString("room_name");
-                        } else {
+                        if (rs.next() && rs.getInt(1) > 0)
                             continue;
+                    }
+
+                    // Ensure section doesn't already have another weekly rescheduled class in this
+                    // slot
+                    String secWeekSql = "SELECT COUNT(*) FROM weekly_rescheduled_schedule WHERE semester_term = ? AND section_id = ? AND new_slot_id = ?";
+                    try (PreparedStatement ps = conn.prepareStatement(secWeekSql)) {
+                        ps.setString(1, semesterTerm);
+                        ps.setInt(2, sectionId);
+                        ps.setInt(3, s.slotId);
+                        ResultSet rs = ps.executeQuery();
+                        if (rs.next() && rs.getInt(1) > 0)
+                            continue;
+                    }
+
+                    // Ensure instructor is free (not teaching Theory/STI elsewhere and not already
+                    // rescheduled here)
+                    if (!isInstructorFreeForTheoryOrMeeting(conn, semesterTerm, s.slotId, instId))
+                        continue;
+
+                    String instWeekSql = "SELECT COUNT(*) FROM weekly_rescheduled_schedule WHERE semester_term = ? AND instructor_id = ? AND new_slot_id = ?";
+                    try (PreparedStatement ps = conn.prepareStatement(instWeekSql)) {
+                        ps.setString(1, semesterTerm);
+                        ps.setInt(2, instId);
+                        ps.setInt(3, s.slotId);
+                        ResultSet rs = ps.executeQuery();
+                        if (rs.next() && rs.getInt(1) > 0)
+                            continue;
+                    }
+
+                    // Room check for Theory class
+                    if (!"STI".equals(sessionType)) {
+                        String roomSql = """
+                                    SELECT r.room_id, r.room_name FROM rooms r
+                                    WHERE r.room_type IN ('CLASSROOM', 'LECTURE_HALL')
+                                    AND r.room_id NOT IN (
+                                        SELECT room_id FROM timetable_schedule
+                                        WHERE semester_term = ? AND slot_id = ? AND room_id IS NOT NULL
+                                    )
+                                    AND r.room_id NOT IN (
+                                        SELECT room_id FROM weekly_rescheduled_schedule
+                                        WHERE semester_term = ? AND new_slot_id = ? AND room_id IS NOT NULL
+                                    ) LIMIT 1
+                                """;
+                        try (PreparedStatement ps = conn.prepareStatement(roomSql)) {
+                            ps.setString(1, semesterTerm);
+                            ps.setInt(2, s.slotId);
+                            ps.setString(3, semesterTerm);
+                            ps.setInt(4, s.slotId);
+                            ResultSet rs = ps.executeQuery();
+                            if (rs.next()) {
+                                chosenRoomId = rs.getInt("room_id");
+                                chosenRoomName = rs.getString("room_name");
+                            } else {
+                                continue;
+                            }
                         }
                     }
-                }
 
-                chosenSlot = s;
-                break;
+                    chosenSlot = s;
+                    if (allowUsingStiSlot) {
+                        // Verify if this slot actually had an STI session in permanent timetable
+                        try (PreparedStatement chkSti = conn.prepareStatement(
+                                "SELECT COUNT(*) FROM timetable_schedule WHERE semester_term = ? AND section_id = ? AND slot_id = ? AND session_type = 'STI'")) {
+                            chkSti.setString(1, semesterTerm);
+                            chkSti.setInt(2, sectionId);
+                            chkSti.setInt(3, s.slotId);
+                            ResultSet rs = chkSti.executeQuery();
+                            if (rs.next() && rs.getInt(1) > 0)
+                                usedStiSlot = true;
+                        }
+                    }
+                    break;
+                }
             }
 
             if (chosenSlot == null) {
                 conn.rollback();
-                return "FAILED: No mutual free slot found for " + secName
+                return "FAILED: No mutual free or STI slot found for " + secName
                         + " and the instructor without overlapping another class.";
             }
 
@@ -633,8 +729,10 @@ public class TimetableGenerator {
             sb.append("• Vacated Slot: ").append(oldDay).append(" Period ").append(oldPeriod).append("\n");
             sb.append("• New Weekly Slot: ").append(chosenSlot.dayOfWeek).append(" Period ").append(chosenSlot.periodNo)
                     .append(" (").append(chosenSlot.startTime).append("-").append(chosenSlot.endTime).append(") in ")
-                    .append(chosenRoomName).append("\n");
-            sb.append("• Verified: Zero overlap with other teachers or existing rescheduled classes.");
+                    .append(chosenRoomName);
+            if (usedStiSlot)
+                sb.append(" [Utilized Section's STI Slot]");
+            sb.append("\n• Verified: Zero overlap with other teachers or existing rescheduled classes.");
 
             if (!existingWeeklyMoves.isEmpty()) {
                 sb.append("\n\nOther Active Weekly Reschedules in ").append(secName).append(":\n");
@@ -696,8 +794,7 @@ public class TimetableGenerator {
 
     private String relocateMasterSession(Connection conn, String term, int allocId, int sectionId,
             int instId, String type) throws SQLException {
-        List<TimeSlot> validSlots = loadValidMorningSlots(conn);
-        Collections.shuffle(validSlots);
+        List<TimeSlot> validSlots = getEarlyPrioritySlots(loadValidMorningSlots(conn));
 
         for (TimeSlot s : validSlots) {
             String checkSec = "SELECT COUNT(*) FROM timetable_schedule WHERE semester_term = ? AND slot_id = ? AND section_id = ?";
@@ -762,7 +859,24 @@ public class TimetableGenerator {
         if (!labs.contains(oldLabRoomId) && oldLabRoomId > 0)
             labs.add(0, oldLabRoomId);
 
-        for (List<TimeSlot> daySlots : slotsByDay.values()) {
+        for (Map.Entry<String, List<TimeSlot>> entry : slotsByDay.entrySet()) {
+            String day = entry.getKey();
+            // Do not move a lab to a day where this section ALREADY has another lab!
+            String chkLabDay = """
+                        SELECT COUNT(*) FROM timetable_schedule sch
+                        JOIN time_slots ts ON sch.slot_id = ts.slot_id
+                        WHERE sch.semester_term = ? AND sch.section_id = ? AND ts.day_of_week = ? AND sch.session_type = 'LAB'
+                    """;
+            try (PreparedStatement ps = conn.prepareStatement(chkLabDay)) {
+                ps.setString(1, term);
+                ps.setInt(2, sectionId);
+                ps.setString(3, day);
+                ResultSet rs = ps.executeQuery();
+                if (rs.next() && rs.getInt(1) > 0)
+                    continue;
+            }
+
+            List<TimeSlot> daySlots = entry.getValue();
             for (int i = 0; i <= daySlots.size() - 3; i++) {
                 TimeSlot s1 = daySlots.get(i), s2 = daySlots.get(i + 1), s3 = daySlots.get(i + 2);
                 if (s2.periodNo != s1.periodNo + 1 || s3.periodNo != s2.periodNo + 1)
@@ -828,15 +942,31 @@ public class TimetableGenerator {
         return false;
     }
 
+    // ========================================================================
+    // CORE GENERATION HELPERS
+    // ========================================================================
     private boolean scheduleLabBlock(PreparedStatement stmt, String term, AllocationTask task,
             Map<String, List<TimeSlot>> slotsByDay, List<Integer> candidateLabs) throws SQLException {
         List<String> days = new ArrayList<>(slotsByDay.keySet());
         Collections.shuffle(days);
 
-        for (String day : days) {
-            List<TimeSlot> daySlots = slotsByDay.get(day);
-            for (int i = 0; i <= daySlots.size() - 3; i++) {
-                TimeSlot s1 = daySlots.get(i), s2 = daySlots.get(i + 1), s3 = daySlots.get(i + 2);
+        for (int startIdx = 0; startIdx <= 4; startIdx++) {
+            for (String day : days) {
+                // RULE 1: Ek din mein 2 different labs nahi ho sakti (Max 1 Lab Block per day
+                // per section)
+                String labDayKey = task.sectionId + "_" + day;
+                if (sectionLabDays.contains(labDayKey))
+                    continue;
+
+                // RULE 2: Ek din mein 3 se zyada different subjects nahi ho sakte
+                if (!canAddCourseOnDay(task.sectionId, day, task.courseId, true))
+                    continue;
+
+                List<TimeSlot> daySlots = slotsByDay.get(day);
+                if (startIdx > daySlots.size() - 3)
+                    continue;
+
+                TimeSlot s1 = daySlots.get(startIdx), s2 = daySlots.get(startIdx + 1), s3 = daySlots.get(startIdx + 2);
                 if (s2.periodNo != s1.periodNo + 1 || s3.periodNo != s2.periodNo + 1)
                     continue;
                 if (!isLabPeopleFree(s1.slotId, task) || !isLabPeopleFree(s2.slotId, task)
@@ -850,7 +980,9 @@ public class TimetableGenerator {
                             addBatchRow(stmt, term, task, s.slotId, labId, "LAB", tag);
                             markLabBusy(s.slotId, task, labId);
                         }
+                        sectionLabDays.add(labDayKey);
                         sectionCourseDays.add(task.sectionId + "_" + task.courseId + "_" + day);
+                        registerCourseOnDay(task.sectionId, day, task.courseId);
                         return true;
                     }
                 }
@@ -860,14 +992,19 @@ public class TimetableGenerator {
     }
 
     private boolean scheduleSingleTheory(PreparedStatement stmt, String term, AllocationTask task,
-            List<TimeSlot> validSlots, List<Integer> rooms, boolean allowSameDay) throws SQLException {
-        List<TimeSlot> shuffledSlots = new ArrayList<>(validSlots);
-        Collections.shuffle(shuffledSlots);
+            List<TimeSlot> validSlots, List<Integer> rooms,
+            boolean allowSameDay, boolean enforceMaxThreeSubjects) throws SQLException {
+        List<TimeSlot> prioritizedSlots = getEarlyPrioritySlots(validSlots);
 
-        for (TimeSlot s : shuffledSlots) {
+        for (TimeSlot s : prioritizedSlots) {
             String dayKey = task.sectionId + "_" + task.courseId + "_" + s.dayOfWeek;
             if (!allowSameDay && sectionCourseDays.contains(dayKey))
                 continue;
+
+            // RULE 2: Ek din mein 3 se zyada different subjects ki classes nahi ho sakti
+            if (!canAddCourseOnDay(task.sectionId, s.dayOfWeek, task.courseId, enforceMaxThreeSubjects))
+                continue;
+
             if (!isInstructorAndSectionFree(s.slotId, task))
                 continue;
 
@@ -879,6 +1016,7 @@ public class TimetableGenerator {
                     addBatchRow(stmt, term, task, s.slotId, roomId, "THEORY", null);
                     markTheoryBusy(s.slotId, task, roomId);
                     sectionCourseDays.add(dayKey);
+                    registerCourseOnDay(task.sectionId, s.dayOfWeek, task.courseId);
                     return true;
                 }
             }
@@ -888,10 +1026,9 @@ public class TimetableGenerator {
 
     private boolean scheduleSTI(PreparedStatement stmt, String term, AllocationTask task,
             List<TimeSlot> validSlots) throws SQLException {
-        List<TimeSlot> shuffledSlots = new ArrayList<>(validSlots);
-        Collections.shuffle(shuffledSlots);
+        List<TimeSlot> prioritizedSlots = getEarlyPrioritySlots(validSlots);
 
-        for (TimeSlot s : shuffledSlots) {
+        for (TimeSlot s : prioritizedSlots) {
             if (isInstructorAndSectionFree(s.slotId, task)) {
                 addBatchRow(stmt, term, task, s.slotId, null, "STI", null);
                 busySectionSlots.add(s.slotId + "_" + task.sectionId);
@@ -956,7 +1093,7 @@ public class TimetableGenerator {
     private List<TimeSlot> loadValidMorningSlots(Connection conn) throws SQLException {
         List<TimeSlot> list = new ArrayList<>();
         String sql = "SELECT slot_id, day_of_week, period_no, start_time, end_time FROM time_slots " +
-                "WHERE shift_type = 'MORNING' AND is_global_blocked = FALSE ORDER BY FIELD(day_of_week,'MON','TUE','WED','THU','FRI'), period_no";
+                "WHERE shift_type = 'MORNING' AND is_global_blocked = FALSE ORDER BY period_no ASC, FIELD(day_of_week,'MON','TUE','WED','THU','FRI')";
         try (Statement st = conn.createStatement(); ResultSet rs = st.executeQuery(sql)) {
             while (rs.next()) {
                 TimeSlot ts = new TimeSlot();
@@ -975,6 +1112,9 @@ public class TimetableGenerator {
         Map<String, List<TimeSlot>> map = new LinkedHashMap<>();
         for (TimeSlot s : slots) {
             map.computeIfAbsent(s.dayOfWeek, k -> new ArrayList<>()).add(s);
+        }
+        for (List<TimeSlot> list : map.values()) {
+            list.sort(Comparator.comparingInt(a -> a.periodNo));
         }
         return map;
     }

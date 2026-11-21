@@ -83,7 +83,9 @@ public class MainApp extends Application {
             refreshAllDropdownsAndTables();
         });
 
+        com.mcs.timetable.engine.DefaultTrainingProgramSeeder.ensureDefaultTimetableLoaded("Fall-2026");
         refreshAllDropdownsAndTables();
+        refreshTab1Grid();
 
         Scene scene = new Scene(tabPane, 1380, 780);
         stage.setTitle("MCS NUST - Automated Training Program & Conflict-Free Scheduler");
@@ -149,10 +151,17 @@ public class MainApp extends Application {
         statusArea.setStyle("-fx-font-family: 'Consolas'; -fx-font-size: 12px;");
 
         generateBtn.setOnAction(e -> {
-            TimetableGenerator generator = new TimetableGenerator();
-            String result = generator.generateForTerm("Fall-2026");
-            statusArea.setText(result);
-            refreshTab1Grid();
+            Alert confirm = new Alert(Alert.AlertType.CONFIRMATION);
+            confirm.setTitle("Regenerate Master Timetable");
+            confirm.setHeaderText("Overwrite Current Training Program?");
+            confirm.setContentText(
+                    "This will replace the current Master Timetable with a freshly generated one (prioritizing early morning periods and keeping late periods free where possible). Continue?");
+            if (confirm.showAndWait().orElse(ButtonType.CANCEL) == ButtonType.OK) {
+                TimetableGenerator generator = new TimetableGenerator();
+                String result = generator.generateForTerm("Fall-2026");
+                statusArea.setText(result);
+                refreshTab1Grid();
+            }
         });
 
         sectionDropdown.setOnAction(e -> refreshTab1Grid());
@@ -851,7 +860,8 @@ public class MainApp extends Application {
             }
         }
 
-        // Load Master Slots (excluding vacated slots if rendering Weekly View)
+        // Load Master Slots (excluding vacated slots and STI slots overridden by weekly
+        // reschedules)
         String query = includeWeeklyOverrides
                 ? """
                         SELECT ts.day_of_week, ts.period_no, c.course_title,
@@ -868,6 +878,10 @@ public class MainApp extends Application {
                         WHERE sch.section_id = ? AND sch.semester_term = 'Fall-2026'
                         AND sch.slot_id NOT IN (
                             SELECT original_slot_id FROM weekly_rescheduled_schedule
+                            WHERE section_id = ? AND semester_term = 'Fall-2026'
+                        )
+                        AND sch.slot_id NOT IN (
+                            SELECT new_slot_id FROM weekly_rescheduled_schedule
                             WHERE section_id = ? AND semester_term = 'Fall-2026'
                         )
                         UNION ALL
@@ -904,6 +918,7 @@ public class MainApp extends Application {
             if (includeWeeklyOverrides) {
                 ps.setInt(2, sectionId);
                 ps.setInt(3, sectionId);
+                ps.setInt(4, sectionId);
             }
             ResultSet rs = ps.executeQuery();
             while (rs.next()) {
@@ -1183,6 +1198,10 @@ public class MainApp extends Application {
                                 SELECT original_slot_id FROM weekly_rescheduled_schedule
                                 WHERE section_id = ? AND semester_term = 'Fall-2026'
                             )
+                            AND sch.slot_id NOT IN (
+                                SELECT new_slot_id FROM weekly_rescheduled_schedule
+                                WHERE section_id = ? AND semester_term = 'Fall-2026'
+                            )
                             UNION ALL
                             SELECT ts.day_of_week, ts.period_no, CONCAT(ts.start_time, '-', ts.end_time) AS timing,
                                    c.course_code, c.course_title, wr.session_type,
@@ -1223,6 +1242,7 @@ public class MainApp extends Application {
             if (isWeeklyRescheduled) {
                 ps.setInt(2, sectionId);
                 ps.setInt(3, sectionId);
+                ps.setInt(4, sectionId);
             }
             ResultSet rs = ps.executeQuery();
             pw.println(
